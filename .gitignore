@@ -1,0 +1,6 @@
+/log/*
+tt
+.bin/*
+values.yaml
+.env.kind.*
+.DS_Store
