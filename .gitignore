@@ -1,6 +1,6 @@
 /log/*
 tt
 .bin/*
-values.yaml
 .env.kind.*
+config.json
 .DS_Store

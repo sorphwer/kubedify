@@ -2,62 +2,103 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd)
-DEFAULT_ENV_FILE="${SCRIPT_DIR}/.env.kind.local"
-EXAMPLE_ENV_FILE="${SCRIPT_DIR}/.env.kind.example"
-ENV_FILE=""
+CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/config.json}"
 DRY_RUN=false
+INSTALL_VERSION_OVERRIDE=""
+ACTION=""
+declare -a ACTION_ARGS=()
+declare -a CLEANUP_FILES=()
 
 usage() {
   cat <<'USAGE'
-Usage: deploy-kind.sh [--env <path>] [--dry-run]
+Usage: deploy-kind.sh [--config <path>] <command> [args]
+
+Commands:
+  install [version] [--dry-run]   Deploy the chart, optionally pinning the chart version.
+  set <KEY> <VALUE...>            Update a configuration entry in config.json.
+  set-docker-username <VALUE>     Shortcut for setting DOCKER_USERNAME.
+  set-docker-pat <VALUE>          Shortcut for setting DOCKER_PAT.
+  list                            List available chart versions from the configured Helm repo.
+  current                         Show the last recorded installed chart version.
 
 Options:
-  --env <path>   Env file to source. Defaults to .env.kind.local (if present)
-                 otherwise .env.kind.example.
-  --dry-run      Print the planned actions without executing docker/kind/kubectl/helm.
-  -h, --help     Show this help.
+  --config <path>                 Override the path to config.json (default: alongside the script).
+  -h, --help                      Show this help.
 USAGE
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --env)
-      ENV_FILE="$2"
+    --config)
+      if [[ $# -lt 2 ]]; then
+        echo "Missing value for --config" >&2
+        exit 1
+      fi
+      CONFIG_FILE="$2"
       shift 2
-      ;;
-    --dry-run)
-      DRY_RUN=true
-      shift
       ;;
     -h|--help)
       usage
       exit 0
       ;;
+    --)
+      shift
+      break
+      ;;
     *)
-      echo "Unknown option: $1" >&2
-      usage
-      exit 1
+      break
       ;;
   esac
 done
 
-if [[ -z "$ENV_FILE" ]]; then
-  if [[ -f "$DEFAULT_ENV_FILE" ]]; then
-    ENV_FILE="$DEFAULT_ENV_FILE"
-  else
-    ENV_FILE="$EXAMPLE_ENV_FILE"
-  fi
+if [[ $# -gt 0 ]]; then
+  COMMAND="$1"
+  shift
+else
+  COMMAND="install"
 fi
 
-if [[ ! -f "$ENV_FILE" ]]; then
-  echo "Env file not found: $ENV_FILE" >&2
-  exit 1
-fi
+case "$COMMAND" in
+  install)
+    ACTION="install"
+    ACTION_ARGS=("$@")
+    ;;
+  set)
+    ACTION="set"
+    ACTION_ARGS=("$@")
+    ;;
+  set-docker-username)
+    ACTION="set"
+    ACTION_ARGS=("DOCKER_USERNAME" "$@")
+    ;;
+  set-docker-pat)
+    ACTION="set"
+    ACTION_ARGS=("DOCKER_PAT" "$@")
+    ;;
+  list)
+    ACTION="list"
+    ACTION_ARGS=("$@")
+    ;;
+  current)
+    ACTION="current"
+    ACTION_ARGS=("$@")
+    ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    echo "Unknown command: $COMMAND" >&2
+    usage
+    exit 1
+    ;;
+esac
 
 cd "$SCRIPT_DIR"
 
 log() {
-  printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$1"
+  printf '[%s] %s
+' "$(date '+%H:%M:%S')" "$1"
 }
 
 die() {
@@ -79,83 +120,305 @@ require_cmd() {
   fi
 }
 
-log "Using env file: $ENV_FILE"
+ensure_config() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    die "Config file not found: $CONFIG_FILE"
+  fi
+}
 
-set -a
-# shellcheck disable=SC1090
-source "$ENV_FILE"
-set +a
+load_config() {
+  ensure_config
+  require_cmd python3
+  while IFS= read -r __kv_line; do
+    [[ -z "$__kv_line" ]] && continue
+    export "$__kv_line"
+  done < <(python3 - "$CONFIG_FILE" <<'PYCFG'
+import json
+import sys
+from pathlib import Path
 
-: "${KIND_CLUSTER_NAME:?KIND_CLUSTER_NAME is required}"
-K8S_NAMESPACE=${K8S_NAMESPACE:-dify}
-K8S_CONTEXT=${K8S_CONTEXT:-"kind-${KIND_CLUSTER_NAME}"}
-HELM_NAMESPACE=${HELM_NAMESPACE:-$K8S_NAMESPACE}
-HELM_VALUES_FILE=${HELM_VALUES_FILE:-values.yaml}
-HELM_VERSION=${HELM_VERSION:-latest}
-HELM_RELEASE_NAME=${HELM_RELEASE_NAME:-dify}
-HELM_CHART=${HELM_CHART:-dify/dify}
-HELM_REPO_NAME=${HELM_REPO_NAME:-}
-HELM_REPO_URL=${HELM_REPO_URL:-}
-HELM_ADDITIONAL_ARGS=${HELM_ADDITIONAL_ARGS:-}
-DOCKER_USERNAME=${DOCKER_USERNAME:-sorphwer}
-DOCKER_PAT=${DOCKER_PAT:-}
-IMAGE_REGISTRY_SERVER=${IMAGE_REGISTRY_SERVER:-https://index.docker.io/v1/}
-IMAGE_REGISTRY_USERNAME=${IMAGE_REGISTRY_USERNAME:-"$DOCKER_USERNAME"}
-IMAGE_REGISTRY_PASSWORD=${IMAGE_REGISTRY_PASSWORD:-"$DOCKER_PAT"}
-PVC_BASE_NAME=${PVC_BASE_NAME:-dify-backend-pvc}
-PV_BASE_NAME=${PV_BASE_NAME:-dify-backend-pv}
-PVC_VERSION_TAG=${PVC_VERSION_TAG:-}
-PVC_ACCESS_MODE=${PVC_ACCESS_MODE:-ReadWriteOnce}
-PVC_SIZE=${PVC_SIZE:-10Gi}
-PVC_STORAGE_CLASS=${PVC_STORAGE_CLASS:-}
-PVC_ANNOTATIONS=${PVC_ANNOTATIONS:-}
-POSTGRES_PVC_BASE_NAME=${POSTGRES_PVC_BASE_NAME:-dify-postgres-pvc}
-POSTGRES_PVC_VERSION_TAG=${POSTGRES_PVC_VERSION_TAG:-}
-POSTGRES_PVC_ACCESS_MODE=${POSTGRES_PVC_ACCESS_MODE:-ReadWriteOnce}
-POSTGRES_PVC_SIZE=${POSTGRES_PVC_SIZE:-10Gi}
-POSTGRES_PVC_STORAGE_CLASS=${POSTGRES_PVC_STORAGE_CLASS:-${PVC_STORAGE_CLASS:-}}
-POSTGRES_PVC_ANNOTATIONS=${POSTGRES_PVC_ANNOTATIONS:-${PVC_ANNOTATIONS:-}}
-IMAGE_REPO_SECRET_NAME=${IMAGE_REPO_SECRET_NAME:-image-repo-secret}
-IMAGE_REGISTRY_EMAIL=${IMAGE_REGISTRY_EMAIL:-unused@example.com}
-IMAGE_REPO_PREFIX=${IMAGE_REPO_PREFIX:-"docker.io/${DOCKER_USERNAME}"}
-IMAGE_REPO_TYPE=${IMAGE_REPO_TYPE:-docker}
-INGRESS_CONTROLLER_MANIFEST=${INGRESS_CONTROLLER_MANIFEST:-https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml}
-LOCAL_DOCKER_IMAGES=${LOCAL_DOCKER_IMAGES:-}
-VALUES_LOG_DIR=${VALUES_LOG_DIR:-"${SCRIPT_DIR}/log"}
-IMAGE_REPO_SECRET_SCRIPT=${IMAGE_REPO_SECRET_SCRIPT:-"${SCRIPT_DIR}/generate-image-repo-secret.sh"}
+path = Path(sys.argv[1])
+text = path.read_text().strip()
+if not text:
+    data = {}
+else:
+    data = json.loads(text)
 
-require_cmd docker
-require_cmd kind
-require_cmd kubectl
+if not isinstance(data, dict):
+    raise SystemExit('Config file must contain a JSON object at the top level')
 
-if [[ -f "$HELM_VALUES_FILE" ]]; then
-  HELM_VALUES_PATH="$HELM_VALUES_FILE"
-elif [[ -f "${SCRIPT_DIR}/$HELM_VALUES_FILE" ]]; then
-  HELM_VALUES_PATH="${SCRIPT_DIR}/$HELM_VALUES_FILE"
-else
-  die "Helm values file not found: $HELM_VALUES_FILE"
-fi
+for key, value in data.items():
+    if value is None:
+        value_str = ''
+    elif isinstance(value, bool):
+        value_str = 'true' if value else 'false'
+    else:
+        value_str = str(value)
+    print(f"{key}={value_str}")
+PYCFG
+  )
+}
 
-PREPARED_HELM_VALUES_PATH="$HELM_VALUES_PATH"
+set_config_value() {
+  local key="$1"
+  local value="$2"
+  require_cmd python3
+  python3 - "$CONFIG_FILE" "$key" "$value" <<'PYSET'
+import json
+import sys
+from pathlib import Path
 
-if $DRY_RUN; then
-  log "Dry-run enabled; commands will not be executed."
-fi
+path = Path(sys.argv[1])
+key = sys.argv[2]
+value = sys.argv[3]
 
-HELM_CMD="helm"
-BIN_DIR="${SCRIPT_DIR}/.bin"
-HELM_ACTUAL_VERSION=""
-if [[ -z "${HELM_CHART_VERSION:-}" || "${HELM_CHART_VERSION}" == "latest" ]]; then
-  HELM_CHART_VERSION_OVERRIDE=""
-else
-  HELM_CHART_VERSION_OVERRIDE=${HELM_CHART_VERSION}
-fi
-HELM_CHART_VERSION_EFFECTIVE=""
-PVC_VERSION_SUFFIX=""
-POSTGRES_PVC_VERSION_SUFFIX=""
-POSTGRES_PVC_NAME=""
-PREPARED_HELM_VALUES_PATH=""
-CLEANUP_FILES=()
+if path.exists():
+    text = path.read_text().strip()
+    data = json.loads(text) if text else {}
+else:
+    data = {}
+
+if not isinstance(data, dict):
+    raise SystemExit('Config file must contain a JSON object at the top level')
+
+data[key] = value
+path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+PYSET
+}
+
+get_config_value() {
+  local key="$1"
+  ensure_config
+  require_cmd python3
+  python3 - "$CONFIG_FILE" "$key" <<'PYGET'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+
+if not path.exists():
+    sys.exit(0)
+
+text = path.read_text().strip()
+if not text:
+    sys.exit(0)
+
+data = json.loads(text)
+value = data.get(key, '')
+if value is None:
+    value = ''
+print(value, end='')
+PYGET
+}
+
+parse_install_args() {
+  INSTALL_VERSION_OVERRIDE=""
+  DRY_RUN=false
+  local positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)
+        DRY_RUN=true
+        shift
+        ;;
+      --)
+        shift
+        positional+=("$@")
+        break
+        ;;
+      *)
+        positional+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if ((${#positional[@]} > 1)); then
+    die "install accepts at most one version argument"
+  fi
+
+  if ((${#positional[@]} == 1)); then
+    INSTALL_VERSION_OVERRIDE="${positional[0]}"
+  fi
+}
+
+handle_set_command() {
+  if ((${#ACTION_ARGS[@]} < 2)); then
+    die "Usage: deploy-kind.sh set <KEY> <VALUE...>"
+  fi
+  local key="${ACTION_ARGS[0]}"
+  if [[ -z "$key" ]]; then
+    die "Configuration key must not be empty"
+  fi
+  local value_parts=("${ACTION_ARGS[@]:1}")
+  local value=""
+  if ((${#value_parts[@]} > 0)); then
+    value="$(printf '%s ' "${value_parts[@]}")"
+    value="${value% }"
+  fi
+  set_config_value "$key" "$value"
+  log "Updated ${key} in ${CONFIG_FILE}"
+}
+
+handle_current_command() {
+  if ((${#ACTION_ARGS[@]} > 0)); then
+    die "current command does not accept additional arguments"
+  fi
+  ensure_config
+  local current
+  current=$(get_config_value "LAST_INSTALLED_VERSION") || current=""
+  if [[ -z "$current" ]]; then
+    echo "No recorded installation yet"
+  else
+    echo "$current"
+  fi
+}
+
+handle_list_command() {
+  if ((${#ACTION_ARGS[@]} > 0)); then
+    die "list command does not accept additional arguments"
+  fi
+  ensure_config
+  load_config
+  require_cmd helm
+  local helm_cmd
+  helm_cmd=$(command -v helm)
+  if [[ -z "${HELM_CHART:-}" ]]; then
+    die "HELM_CHART is not configured in ${CONFIG_FILE}"
+  fi
+  if [[ -n "${HELM_REPO_NAME:-}" && -n "${HELM_REPO_URL:-}" ]]; then
+    "$helm_cmd" repo add "$HELM_REPO_NAME" "$HELM_REPO_URL" >/dev/null 2>&1 || true
+  fi
+  "$helm_cmd" repo update >/dev/null 2>&1 || true
+  "$helm_cmd" search repo "$HELM_CHART" --versions
+}
+
+record_install_metadata() {
+  if $DRY_RUN; then
+    log "Dry-run enabled; skipped recording install metadata."
+    return
+  fi
+
+  local recorded_version=""
+  if [[ -n "${HELM_CHART_VERSION_RAW:-}" ]]; then
+    recorded_version="$HELM_CHART_VERSION_RAW"
+  elif [[ -n "${HELM_CHART_VERSION_OVERRIDE:-}" ]]; then
+    recorded_version="$HELM_CHART_VERSION_OVERRIDE"
+  elif [[ -n "${HELM_CHART_VERSION:-}" ]]; then
+    recorded_version="$HELM_CHART_VERSION"
+  fi
+
+  if [[ -z "$recorded_version" ]]; then
+    log "Warning: unable to determine chart version to record."
+    return
+  fi
+
+  set_config_value "LAST_INSTALLED_VERSION" "$recorded_version"
+  if [[ -n "${INSTALL_VERSION_OVERRIDE:-}" ]]; then
+    local desired="$recorded_version"
+    if [[ -n "${HELM_CHART_VERSION_RAW:-}" ]]; then
+      desired="$HELM_CHART_VERSION_RAW"
+    fi
+    set_config_value "HELM_CHART_VERSION" "$desired"
+  fi
+  log "Recorded last installed chart version: ${recorded_version}"
+}
+
+install_flow() {
+  parse_install_args "${ACTION_ARGS[@]}"
+  ensure_config
+  log "Using config file: $CONFIG_FILE"
+  load_config
+
+  if [[ -n "$INSTALL_VERSION_OVERRIDE" ]]; then
+    export HELM_CHART_VERSION="$INSTALL_VERSION_OVERRIDE"
+  fi
+
+  : "${KIND_CLUSTER_NAME:?KIND_CLUSTER_NAME is required}"
+  K8S_NAMESPACE=${K8S_NAMESPACE:-dify}
+  K8S_CONTEXT=${K8S_CONTEXT:-"kind-${KIND_CLUSTER_NAME}"}
+  HELM_NAMESPACE=${HELM_NAMESPACE:-$K8S_NAMESPACE}
+  HELM_VALUES_FILE=${HELM_VALUES_FILE:-values.yaml}
+  HELM_VERSION=${HELM_VERSION:-latest}
+  HELM_RELEASE_NAME=${HELM_RELEASE_NAME:-dify}
+  HELM_CHART=${HELM_CHART:-dify/dify}
+  HELM_REPO_NAME=${HELM_REPO_NAME:-}
+  HELM_REPO_URL=${HELM_REPO_URL:-}
+  HELM_ADDITIONAL_ARGS=${HELM_ADDITIONAL_ARGS:-}
+  DOCKER_USERNAME=${DOCKER_USERNAME:-}
+  DOCKER_PAT=${DOCKER_PAT:-}
+  IMAGE_REGISTRY_SERVER=${IMAGE_REGISTRY_SERVER:-https://index.docker.io/v1/}
+  IMAGE_REGISTRY_USERNAME=${IMAGE_REGISTRY_USERNAME:-"${DOCKER_USERNAME:-}"}
+  IMAGE_REGISTRY_PASSWORD=${IMAGE_REGISTRY_PASSWORD:-"${DOCKER_PAT:-}"}
+  PVC_BASE_NAME=${PVC_BASE_NAME:-dify-backend-pvc}
+  PV_BASE_NAME=${PV_BASE_NAME:-dify-backend-pv}
+  PVC_VERSION_TAG=${PVC_VERSION_TAG:-}
+  PVC_ACCESS_MODE=${PVC_ACCESS_MODE:-ReadWriteOnce}
+  PVC_SIZE=${PVC_SIZE:-10Gi}
+  PVC_STORAGE_CLASS=${PVC_STORAGE_CLASS:-}
+  PVC_ANNOTATIONS=${PVC_ANNOTATIONS:-}
+  POSTGRES_PVC_BASE_NAME=${POSTGRES_PVC_BASE_NAME:-dify-postgres-pvc}
+  POSTGRES_PVC_VERSION_TAG=${POSTGRES_PVC_VERSION_TAG:-}
+  POSTGRES_PVC_ACCESS_MODE=${POSTGRES_PVC_ACCESS_MODE:-ReadWriteOnce}
+  POSTGRES_PVC_SIZE=${POSTGRES_PVC_SIZE:-10Gi}
+  POSTGRES_PVC_STORAGE_CLASS=${POSTGRES_PVC_STORAGE_CLASS:-${PVC_STORAGE_CLASS:-}}
+  POSTGRES_PVC_ANNOTATIONS=${POSTGRES_PVC_ANNOTATIONS:-${PVC_ANNOTATIONS:-}}
+  IMAGE_REPO_SECRET_NAME=${IMAGE_REPO_SECRET_NAME:-image-repo-secret}
+  IMAGE_REGISTRY_EMAIL=${IMAGE_REGISTRY_EMAIL:-unused@example.com}
+  IMAGE_REPO_PREFIX=${IMAGE_REPO_PREFIX:-"docker.io/${DOCKER_USERNAME:-}"}
+  IMAGE_REPO_TYPE=${IMAGE_REPO_TYPE:-docker}
+  INGRESS_CONTROLLER_MANIFEST=${INGRESS_CONTROLLER_MANIFEST:-https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml}
+  LOCAL_DOCKER_IMAGES=${LOCAL_DOCKER_IMAGES:-}
+  VALUES_LOG_DIR=${VALUES_LOG_DIR:-"${SCRIPT_DIR}/log"}
+  IMAGE_REPO_SECRET_SCRIPT=${IMAGE_REPO_SECRET_SCRIPT:-"${SCRIPT_DIR}/generate-image-repo-secret.sh"}
+
+  require_cmd docker
+  require_cmd kind
+  require_cmd kubectl
+
+  if [[ -f "$HELM_VALUES_FILE" ]]; then
+    HELM_VALUES_PATH="$HELM_VALUES_FILE"
+  elif [[ -f "${SCRIPT_DIR}/$HELM_VALUES_FILE" ]]; then
+    HELM_VALUES_PATH="${SCRIPT_DIR}/$HELM_VALUES_FILE"
+  else
+    die "Helm values file not found: $HELM_VALUES_FILE"
+  fi
+
+  if $DRY_RUN; then
+    log "Dry-run enabled; commands will not be executed."
+  fi
+
+  HELM_CMD="helm"
+  BIN_DIR="${SCRIPT_DIR}/.bin"
+  HELM_ACTUAL_VERSION=""
+  if [[ -z "${HELM_CHART_VERSION:-}" || "${HELM_CHART_VERSION}" == "latest" ]]; then
+    HELM_CHART_VERSION_OVERRIDE=""
+  else
+    HELM_CHART_VERSION_OVERRIDE=${HELM_CHART_VERSION}
+  fi
+  HELM_CHART_VERSION_EFFECTIVE=""
+  HELM_CHART_VERSION_RAW=""
+  PVC_VERSION_SUFFIX=""
+  POSTGRES_PVC_VERSION_SUFFIX=""
+  POSTGRES_PVC_NAME=""
+  PREPARED_HELM_VALUES_PATH=""
+  CLEANUP_FILES=()
+
+  trap cleanup EXIT
+
+  setup_helm_version
+  resolve_helm_actual_version
+  resolve_chart_version
+  derive_pvc_name
+  derive_pv_name
+  derive_postgres_pvc_name
+  prepare_values_file
+  persist_prepared_values_file
+  main
+  record_install_metadata
+}
 
 cleanup() {
   if [[ ${#CLEANUP_FILES[@]} -eq 0 ]]; then
@@ -165,8 +428,6 @@ cleanup() {
     [[ -n "$file" && -f "$file" ]] && rm -f "$file"
   done
 }
-
-trap cleanup EXIT
 
 setup_helm_version() {
   if [[ -z "$HELM_VERSION" || "$HELM_VERSION" == "latest" ]]; then
@@ -235,8 +496,6 @@ setup_helm_version() {
   log "Using freshly downloaded helm ${HELM_VERSION} at ${target_path}"
 }
 
-setup_helm_version
-
 resolve_helm_actual_version() {
   if [[ $DRY_RUN == true && ! -x "$HELM_CMD" ]]; then
     log "Skipping helm version detection (binary not available during dry-run)"
@@ -276,8 +535,6 @@ sanitize_dns_label() {
   printf '%s' "$lowered"
 }
 
-resolve_helm_actual_version
-
 resolve_chart_version() {
   if [[ -n "$HELM_CHART_VERSION_EFFECTIVE" ]]; then
     return
@@ -308,17 +565,17 @@ resolve_chart_version() {
     log "Unable to determine chart version for ${HELM_CHART}"
     if [[ -n "$HELM_CHART_VERSION_OVERRIDE" ]]; then
       HELM_CHART_VERSION_EFFECTIVE=$(sanitize_dns_label "$HELM_CHART_VERSION_OVERRIDE")
+      HELM_CHART_VERSION_RAW="$HELM_CHART_VERSION_OVERRIDE"
     fi
     return
   fi
-  local version
-  version=$(printf '%s' "$output" | awk '{print $2}')
-  version=$(sanitize_dns_label "$version")
+  local version_raw version
+  version_raw=$(printf '%s' "$output" | awk '{print $2}')
+  HELM_CHART_VERSION_RAW="$version_raw"
+  version=$(sanitize_dns_label "$version_raw")
   HELM_CHART_VERSION_EFFECTIVE="$version"
   log "Helm chart version detected: ${HELM_CHART_VERSION_EFFECTIVE:-unknown}"
 }
-
-resolve_chart_version
 
 derive_pvc_name() {
   [[ -n "$PVC_BASE_NAME" ]] || die "PVC_BASE_NAME must not be empty"
@@ -347,8 +604,6 @@ derive_pvc_name() {
   log "Using PVC name: ${PVC_NAME}"
 }
 
-derive_pvc_name
-
 derive_pv_name() {
   local base="$PV_BASE_NAME"
   [[ -n "$base" ]] || die "PV_BASE_NAME must not be empty"
@@ -362,8 +617,6 @@ derive_pv_name() {
   PV_NAME="$final_name"
   log "Using PV name: ${PV_NAME}"
 }
-derive_pv_name
-
 derive_postgres_pvc_name() {
   [[ -n "$POSTGRES_PVC_BASE_NAME" ]] || die "POSTGRES_PVC_BASE_NAME must not be empty"
   local final_name="$POSTGRES_PVC_BASE_NAME"
@@ -385,8 +638,6 @@ derive_postgres_pvc_name() {
   POSTGRES_PVC_NAME="$final_name"
   log "Using Postgres PVC name: ${POSTGRES_PVC_NAME}"
 }
-derive_postgres_pvc_name
-
 prepare_values_file() {
   if [[ -z "$HELM_VALUES_PATH" ]]; then
     return
@@ -735,4 +986,20 @@ main() {
   log "Deployment flow completed."
 }
 
-main
+case "$ACTION" in
+  set)
+    handle_set_command
+    ;;
+  list)
+    handle_list_command
+    ;;
+  current)
+    handle_current_command
+    ;;
+  install)
+    install_flow
+    ;;
+  *)
+    die "Unhandled action: $ACTION"
+    ;;
+esac
