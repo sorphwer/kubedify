@@ -2,9 +2,31 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd)
-CONFIG_DIR="${SCRIPT_DIR}/profiles"
-PROFILE_STATE_FILE="${SCRIPT_DIR}/.config-profile"
+TEMPLATE_PROFILES_DIR="${SCRIPT_DIR}/profiles"
 DEFAULT_PROFILE_NAME="default"
+
+CONFIG_HOME_OVERRIDE="${KUBEDIFY_CONFIG_HOME:-}"
+if [[ -n "$CONFIG_HOME_OVERRIDE" ]]; then
+  CONFIG_ROOT="$CONFIG_HOME_OVERRIDE"
+else
+  CONFIG_ROOT="${XDG_CONFIG_HOME:-${HOME}/.config}/kubedify"
+fi
+
+case "$CONFIG_ROOT" in
+  "~")
+    CONFIG_ROOT="${HOME}"
+    ;;
+  "~/"*)
+    CONFIG_ROOT="${HOME}/${CONFIG_ROOT:2}"
+    ;;
+esac
+
+CONFIG_DIR="${CONFIG_ROOT}/profiles"
+PROFILE_STATE_FILE="${CONFIG_ROOT}/.config-profile"
+LEGACY_CONFIG_DIR="${SCRIPT_DIR}/profiles"
+LEGACY_PROFILE_STATE_FILE="${SCRIPT_DIR}/.config-profile"
+
+SENSITIVE_CONFIG_KEYS=(DOCKER_PAT DOCKER_USERNAME)
 
 INITIAL_CONFIG_FILE="${CONFIG_FILE:-}"
 CONFIG_FILE_OVERRIDE=""
@@ -12,12 +34,42 @@ PROFILE_OVERRIDE=""
 PROFILE_STATE_WRITABLE=true
 CONFIG_FILE=""
 PROFILE_DIR=""
+PROFILE_SECRETS_FILE=""
 ACTIVE_PROFILE=""
 DRY_RUN=false
 INSTALL_VERSION_OVERRIDE=""
 ACTION=""
 declare -a ACTION_ARGS=()
 declare -a CLEANUP_FILES=()
+
+is_sensitive_config_key() {
+  local key="$1"
+  for sensitive in "${SENSITIVE_CONFIG_KEYS[@]}"; do
+    if [[ "$sensitive" == "$key" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+mask_secret_value() {
+  local value="$1"
+  if [[ -z "$value" ]]; then
+    printf '<unset>'
+    return
+  fi
+  local length=${#value}
+  if (( length <= 4 )); then
+    printf '%s' "$(printf '%*s' "$length" '' | tr ' ' '*')"
+    return
+  fi
+  local prefix="${value:0:2}"
+  local suffix="${value: -2}"
+  local middle_len=$((length - 4))
+  local middle
+  middle=$(printf '%*s' "$middle_len" '' | tr ' ' '*')
+  printf '%s%s%s' "$prefix" "$middle" "$suffix"
+}
 
 usage() {
   cat <<'USAGE'
@@ -26,8 +78,8 @@ Usage: deploy-kind.sh [--config <path>] [--profile <name>] <command> [args]
 Commands:
   install [version] [--dry-run]   Deploy the chart, optionally pinning the chart version.
   set <KEY> <VALUE...>            Update a configuration entry in the active config.
-  set-docker-username <VALUE>     Shortcut for setting DOCKER_USERNAME.
-  set-docker-pat <VALUE>          Shortcut for setting DOCKER_PAT.
+  set-docker-username <VALUE>     Store DOCKER_USERNAME in the profile secrets file.
+  set-docker-pat <VALUE>          Store DOCKER_PAT in the profile secrets file.
   list                            List available chart versions from the configured Helm repo.
   current                         Show the last recorded installed chart version.
   show                            Print the active configuration JSON.
@@ -98,12 +150,12 @@ case "$COMMAND" in
     ACTION_ARGS=("$@")
     ;;
   set-docker-username)
-    ACTION="set"
-    ACTION_ARGS=("DOCKER_USERNAME" "$@")
+    ACTION="set-docker-username"
+    ACTION_ARGS=("$@")
     ;;
   set-docker-pat)
-    ACTION="set"
-    ACTION_ARGS=("DOCKER_PAT" "$@")
+    ACTION="set-docker-pat"
+    ACTION_ARGS=("$@")
     ;;
   list)
     ACTION="list"
@@ -158,7 +210,13 @@ require_cmd() {
 }
 
 ensure_profiles_dir() {
-  mkdir -p "$CONFIG_DIR"
+  if ! mkdir -p "$CONFIG_DIR"; then
+    cat <<EOF >&2
+Failed to prepare Kubedify configuration directory at ${CONFIG_DIR}.
+Ensure the path is writable or rerun with --config <path> (or set KUBEDIFY_CONFIG_HOME) pointing to a writable location.
+EOF
+    exit 1
+  fi
 }
 
 validate_profile_name() {
@@ -186,6 +244,11 @@ values_path_for_profile() {
   printf '%s/values.yaml' "$(profile_dir_for_name "$name")"
 }
 
+secrets_path_for_profile() {
+  local name="$1"
+  printf '%s/secrets.env' "$(profile_dir_for_name "$name")"
+}
+
 migrate_legacy_profile_structure() {
   local name="$1"
   local legacy_config="${CONFIG_DIR}/${name}.json"
@@ -196,6 +259,37 @@ migrate_legacy_profile_structure() {
     mkdir -p "$profile_dir"
     mv "$legacy_config" "$target_config"
     log "Moved legacy profile '${name}' config to ${target_config}"
+  fi
+}
+
+migrate_legacy_profile_root() {
+  if [[ "$CONFIG_DIR" == "$LEGACY_CONFIG_DIR" ]]; then
+    return
+  fi
+  if [[ ! -d "$LEGACY_CONFIG_DIR" ]]; then
+    return
+  fi
+
+  shopt -s dotglob nullglob
+  for legacy_profile_dir in "$LEGACY_CONFIG_DIR"/*; do
+    [[ -d "$legacy_profile_dir" ]] || continue
+    local name
+    name=$(basename "$legacy_profile_dir")
+    local target
+    target=$(profile_dir_for_name "$name")
+    if [[ -d "$target" ]]; then
+      continue
+    fi
+    mkdir -p "$target"
+    cp -R "$legacy_profile_dir"/. "$target"/
+    log "Seeded profile '${name}' at ${target}"
+  done
+  shopt -u dotglob nullglob
+
+  if [[ -f "$LEGACY_PROFILE_STATE_FILE" && ! -f "$PROFILE_STATE_FILE" ]]; then
+    mkdir -p "$(dirname "$PROFILE_STATE_FILE")"
+    cp "$LEGACY_PROFILE_STATE_FILE" "$PROFILE_STATE_FILE"
+    log "Seeded profile state at ${PROFILE_STATE_FILE}"
   fi
 }
 
@@ -216,6 +310,22 @@ migrate_legacy_default_assets() {
     mv "$legacy_values" "$target_values"
     log "Moved legacy values.yaml to ${target_values}"
   fi
+
+  local template_dir="${TEMPLATE_PROFILES_DIR}/${DEFAULT_PROFILE_NAME}"
+  if [[ -d "$template_dir" ]]; then
+    local template_config="${template_dir}/config.json"
+    local template_values="${template_dir}/values.yaml"
+    if [[ ! -f "$target_config" && -f "$template_config" ]]; then
+      mkdir -p "$target_dir"
+      cp "$template_config" "$target_config"
+      log "Seeded default config from template at ${template_config}"
+    fi
+    if [[ ! -f "$target_values" && -f "$template_values" ]]; then
+      mkdir -p "$target_dir"
+      cp "$template_values" "$target_values"
+      log "Seeded default values from template at ${template_values}"
+    fi
+  fi
 }
 
 current_profile_from_state() {
@@ -234,6 +344,7 @@ write_profile_state() {
     return
   fi
   [[ -n "$ACTIVE_PROFILE" ]] || return
+  mkdir -p "$(dirname "$PROFILE_STATE_FILE")"
   printf '%s\n' "$ACTIVE_PROFILE" >"$PROFILE_STATE_FILE"
 }
 
@@ -244,11 +355,22 @@ bootstrap_profile_dir() {
   dir=$(profile_dir_for_name "$name")
   local config="$dir/config.json"
   local values="$dir/values.yaml"
+  local template_dir="${TEMPLATE_PROFILES_DIR}/${name}"
+  local template_config="${template_dir}/config.json"
+  local template_values="${template_dir}/values.yaml"
+  local template_secrets="${template_dir}/secrets.env"
+  local default_template_config="${TEMPLATE_PROFILES_DIR}/${DEFAULT_PROFILE_NAME}/config.json"
+  local default_template_values="${TEMPLATE_PROFILES_DIR}/${DEFAULT_PROFILE_NAME}/values.yaml"
+  local default_template_secrets="${TEMPLATE_PROFILES_DIR}/${DEFAULT_PROFILE_NAME}/secrets.env"
   mkdir -p "$dir"
 
   if [[ ! -f "$config" ]]; then
     if [[ "$name" != "$DEFAULT_PROFILE_NAME" && -f "$(config_path_for_profile "$DEFAULT_PROFILE_NAME")" ]]; then
       cp "$(config_path_for_profile "$DEFAULT_PROFILE_NAME")" "$config"
+    elif [[ -f "$template_config" ]]; then
+      cp "$template_config" "$config"
+    elif [[ -f "$default_template_config" ]]; then
+      cp "$default_template_config" "$config"
     elif [[ -f "$SCRIPT_DIR/config.example.json" ]]; then
       cp "$SCRIPT_DIR/config.example.json" "$config"
     else
@@ -260,6 +382,10 @@ bootstrap_profile_dir() {
   if [[ ! -f "$values" ]]; then
     if [[ "$name" != "$DEFAULT_PROFILE_NAME" && -f "$(values_path_for_profile "$DEFAULT_PROFILE_NAME")" ]]; then
       cp "$(values_path_for_profile "$DEFAULT_PROFILE_NAME")" "$values"
+    elif [[ -f "$template_values" ]]; then
+      cp "$template_values" "$values"
+    elif [[ -f "$default_template_values" ]]; then
+      cp "$default_template_values" "$values"
     elif [[ -f "$SCRIPT_DIR/values.example.yaml" ]]; then
       cp "$SCRIPT_DIR/values.example.yaml" "$values"
     elif [[ -f "$SCRIPT_DIR/values.yaml" ]]; then
@@ -268,6 +394,19 @@ bootstrap_profile_dir() {
       printf '# add chart overrides here\n' >"$values"
     fi
     log "Created values file for profile '${name}' at ${values}"
+  fi
+
+  local secrets="$dir/secrets.env"
+  if [[ ! -f "$secrets" ]]; then
+    if [[ -f "$template_secrets" ]]; then
+      cp "$template_secrets" "$secrets"
+    elif [[ -f "$default_template_secrets" ]]; then
+      cp "$default_template_secrets" "$secrets"
+    else
+      : >"$secrets"
+    fi
+    chmod 600 "$secrets" 2>/dev/null || true
+    log "Created secrets file for profile '${name}' at ${secrets}"
   fi
 }
 
@@ -289,12 +428,122 @@ ensure_profile_config_exists() {
   bootstrap_profile_dir "$profile"
 }
 
+ensure_profile_secrets_file() {
+  if [[ -z "$PROFILE_SECRETS_FILE" ]]; then
+    die "Secret storage is unavailable when --config is supplied."
+  fi
+  local secrets_dir
+  secrets_dir=$(dirname "$PROFILE_SECRETS_FILE")
+  mkdir -p "$secrets_dir"
+  if [[ ! -f "$PROFILE_SECRETS_FILE" ]]; then
+    local old_umask
+    old_umask=$(umask)
+    umask 0077
+    : >"$PROFILE_SECRETS_FILE"
+    umask "$old_umask"
+  fi
+  chmod 600 "$PROFILE_SECRETS_FILE" 2>/dev/null || true
+}
+
+load_profile_secrets() {
+  if [[ -z "$PROFILE_SECRETS_FILE" || ! -f "$PROFILE_SECRETS_FILE" ]]; then
+    return
+  fi
+  require_cmd python3
+  while IFS= read -r __secret_line; do
+    [[ -z "$__secret_line" ]] && continue
+    local __key=${__secret_line%%=*}
+    local __value=${__secret_line#*=}
+    if [[ -n "${!__key+x}" ]]; then
+      continue
+    fi
+    export "${__key}=${__value}"
+  done < <(python3 - "$PROFILE_SECRETS_FILE" <<'PYSECRETS'
+import pathlib
+import shlex
+import sys
+import re
+
+path = pathlib.Path(sys.argv[1])
+if not path.exists():
+    sys.exit(0)
+
+pattern = re.compile(r'^[A-Z_][A-Z0-9_]*$')
+
+for lineno, raw in enumerate(path.read_text().splitlines(), 1):
+    line = raw.strip()
+    if not line or line.startswith('#'):
+        continue
+    if '=' not in line:
+        raise SystemExit(f"Invalid secrets entry on line {lineno}: {raw}")
+    key, value = line.split('=', 1)
+    key = key.strip()
+    if not pattern.match(key):
+        raise SystemExit(f"Invalid secret key '{key}' on line {lineno}")
+    decoded_parts = shlex.split(value, posix=True)
+    if len(decoded_parts) > 1:
+        raise SystemExit(f"Invalid secret value on line {lineno}: {raw}")
+    decoded = decoded_parts[0] if decoded_parts else ''
+    print(f"{key}={decoded}")
+PYSECRETS
+  )
+}
+
+set_secret_value() {
+  local key="$1"
+  local value="$2"
+  ensure_profile_secrets_file
+  require_cmd python3
+  python3 - "$PROFILE_SECRETS_FILE" "$key" "$value" <<'PYSETSECRET'
+import os
+import shlex
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+value = sys.argv[3]
+
+lines = []
+if path.exists():
+    lines = path.read_text().splitlines()
+
+written = False
+new_lines = []
+for raw in lines:
+    if not raw.strip() or raw.lstrip().startswith('#'):
+        new_lines.append(raw)
+        continue
+    if '=' not in raw:
+        new_lines.append(raw)
+        continue
+    current_key, _ = raw.split('=', 1)
+    if current_key == key:
+        new_lines.append(f"{key}={shlex.quote(value)}")
+        written = True
+    else:
+        new_lines.append(raw)
+
+if not written:
+    new_lines.append(f"{key}={shlex.quote(value)}")
+
+path.write_text("\n".join(new_lines).rstrip("\n") + "\n")
+try:
+    os.chmod(path, 0o600)
+except OSError:
+    pass
+PYSETSECRET
+  export "${key}=${value}"
+}
+
 init_profile_environment() {
   ensure_profiles_dir
+  migrate_legacy_profile_root
   migrate_legacy_default_assets
   if [[ -n "$CONFIG_FILE_OVERRIDE" ]]; then
     CONFIG_FILE="$CONFIG_FILE_OVERRIDE"
     PROFILE_DIR=$(dirname "$CONFIG_FILE")
+    PROFILE_SECRETS_FILE=""
     ACTIVE_PROFILE=""
     return
   fi
@@ -313,6 +562,7 @@ init_profile_environment() {
   bootstrap_profile_dir "$ACTIVE_PROFILE"
   PROFILE_DIR=$(profile_dir_for_name "$ACTIVE_PROFILE")
   CONFIG_FILE=$(config_path_for_profile "$ACTIVE_PROFILE")
+  PROFILE_SECRETS_FILE=$(secrets_path_for_profile "$ACTIVE_PROFILE")
   write_profile_state
 }
 
@@ -341,10 +591,24 @@ init_profile_environment
 
 load_config() {
   ensure_config
+  load_profile_secrets
   require_cmd python3
+  local warned_sensitive_keys=""
   while IFS= read -r __kv_line; do
     [[ -z "$__kv_line" ]] && continue
-    export "$__kv_line"
+    local __key=${__kv_line%%=*}
+    local __value=${__kv_line#*=}
+    if is_sensitive_config_key "$__key"; then
+      if [[ -n "$__value" && $warned_sensitive_keys != *" ${__key} "* ]]; then
+        log "Ignoring stored value for sensitive key '${__key}'; provide it via environment variables instead."
+        warned_sensitive_keys+=" ${__key} "
+      fi
+      continue
+    fi
+    if [[ -n "${!__key+x}" ]]; then
+      continue
+    fi
+    export "${__key}=${__value}"
   done < <(python3 - "$CONFIG_FILE" <<'PYCFG'
 import json
 import sys
@@ -375,6 +639,9 @@ PYCFG
 set_config_value() {
   local key="$1"
   local value="$2"
+  if is_sensitive_config_key "$key"; then
+    die "Configuration key '$key' is managed via the profile secrets file. Use 'kubedify set-docker-username'/'kubedify set-docker-pat' or export the variable manually."
+  fi
   ensure_config_for_writing
   require_cmd python3
   python3 - "$CONFIG_FILE" "$key" "$value" <<'PYSET'
@@ -466,6 +733,9 @@ handle_set_command() {
   if [[ -z "$key" ]]; then
     die "Configuration key must not be empty"
   fi
+  if is_sensitive_config_key "$key"; then
+    die "Configuration key '$key' cannot be persisted in config.json. Use 'kubedify set-docker-username'/'kubedify set-docker-pat' or provide it via environment variables."
+  fi
   local value_parts=("${ACTION_ARGS[@]:1}")
   local value=""
   if ((${#value_parts[@]} > 0)); then
@@ -474,6 +744,24 @@ handle_set_command() {
   fi
   set_config_value "$key" "$value"
   log "Updated ${key} in ${CONFIG_FILE}"
+}
+
+handle_set_docker_username_command() {
+  if ((${#ACTION_ARGS[@]} != 1)); then
+    die "Usage: deploy-kind.sh set-docker-username <VALUE>"
+  fi
+  local value="${ACTION_ARGS[0]}"
+  set_secret_value "DOCKER_USERNAME" "$value"
+  log "Stored DOCKER_USERNAME in ${PROFILE_SECRETS_FILE}"
+}
+
+handle_set_docker_pat_command() {
+  if ((${#ACTION_ARGS[@]} != 1)); then
+    die "Usage: deploy-kind.sh set-docker-pat <VALUE>"
+  fi
+  local value="${ACTION_ARGS[0]}"
+  set_secret_value "DOCKER_PAT" "$value"
+  log "Stored DOCKER_PAT in ${PROFILE_SECRETS_FILE}"
 }
 
 handle_current_command() {
@@ -495,12 +783,16 @@ handle_show_command() {
     die "show command does not accept additional arguments"
   fi
   ensure_config
+  load_profile_secrets
   require_cmd python3
   if [[ -n "$ACTIVE_PROFILE" ]]; then
     echo "Active profile: $ACTIVE_PROFILE"
   fi
   echo "Config path: $CONFIG_FILE"
-  python3 - "$CONFIG_FILE" <<'PYSHOW'
+  if [[ -n "$PROFILE_SECRETS_FILE" ]]; then
+    echo "Secrets path: $PROFILE_SECRETS_FILE"
+  fi
+  python3 - "$CONFIG_FILE" "${SENSITIVE_CONFIG_KEYS[@]}" <<'PYSHOW'
 import json
 import sys
 from pathlib import Path
@@ -512,8 +804,32 @@ if not text:
 else:
     data = json.loads(text)
 
+sensitive = set(sys.argv[2:])
+for key in sensitive:
+    if key in data:
+        if data[key] in (None, ""):
+            data[key] = "<managed via secrets.env>"
+        else:
+            data[key] = "<redacted>"
+
 print(json.dumps(data, indent=2, sort_keys=True))
 PYSHOW
+  print_secrets_summary
+}
+
+print_secrets_summary() {
+  if [[ -z "$PROFILE_SECRETS_FILE" || ! -f "$PROFILE_SECRETS_FILE" ]]; then
+    return
+  fi
+  local username="${DOCKER_USERNAME:-}"
+  local pat="${DOCKER_PAT:-}"
+  echo "Secrets summary:"
+  if [[ -n "$username" ]]; then
+    echo "  DOCKER_USERNAME: $username"
+  else
+    echo "  DOCKER_USERNAME: <unset>"
+  fi
+  echo "  DOCKER_PAT: $(mask_secret_value "$pat")"
 }
 
 handle_list_command() {
@@ -626,6 +942,7 @@ profile_use() {
   ACTIVE_PROFILE="$name"
   CONFIG_FILE="$path"
   PROFILE_DIR="$dir"
+  PROFILE_SECRETS_FILE=$(secrets_path_for_profile "$name")
   CONFIG_FILE_OVERRIDE=""
   PROFILE_OVERRIDE=""
   PROFILE_STATE_WRITABLE=true
@@ -1363,6 +1680,12 @@ main() {
 case "$ACTION" in
   set)
     handle_set_command
+    ;;
+  set-docker-username)
+    handle_set_docker_username_command
+    ;;
+  set-docker-pat)
+    handle_set_docker_pat_command
     ;;
   list)
     handle_list_command

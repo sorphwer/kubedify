@@ -1,7 +1,8 @@
 /log/*
 .bin/*
 profiles/*
-!profiles/default/*
+!profiles/default
+!profiles/default/**
 .config-profile
 .DS_Store
 
@@ -61,4 +62,3 @@ jspm_packages/
 .Trashes
 ehthumbs.db
 Thumbs.db
-

@@ -4,6 +4,7 @@ const { Command } = require('commander');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const chalkModule = require('chalk');
 const chalk = chalkModule.default || chalkModule;
 const oraModule = require('ora');
@@ -13,6 +14,123 @@ const pkg = require('../package.json');
 
 const program = new Command();
 const deployScriptPath = path.resolve(__dirname, '..', 'deploy-kind.sh');
+const deployScriptDir = path.dirname(deployScriptPath);
+
+const WRITE_COMMANDS = new Set(['install', 'set', 'set-docker-username', 'set-docker-pat', 'profile']);
+let installDirWritableWarningShown = false;
+
+function expandHome(p) {
+  if (!p) {
+    return p;
+  }
+  if (p.startsWith('~')) {
+    const home = os.homedir();
+    if (!home) {
+      return p;
+    }
+    if (p === '~') {
+      return home;
+    }
+    if (p.startsWith('~/')) {
+      return path.join(home, p.slice(2));
+    }
+    return path.join(home, p.slice(1));
+  }
+  return p;
+}
+
+function resolveConfigTarget(globalOptions) {
+  if (globalOptions?.config) {
+    return path.resolve(expandHome(globalOptions.config));
+  }
+
+  if (process.env.KUBEDIFY_CONFIG_HOME) {
+    return path.resolve(expandHome(process.env.KUBEDIFY_CONFIG_HOME));
+  }
+
+  if (process.env.XDG_CONFIG_HOME) {
+    return path.resolve(expandHome(process.env.XDG_CONFIG_HOME), 'kubedify');
+  }
+
+  const homeDir = os.homedir();
+  if (homeDir) {
+    return path.resolve(homeDir, '.config', 'kubedify');
+  }
+
+  return path.resolve(process.cwd(), '.kubedify');
+}
+
+function findExistingAncestor(targetPath) {
+  let current = targetPath;
+  while (!fs.existsSync(current)) {
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+  return current;
+}
+
+function isWritablePath(targetPath) {
+  const resolved = path.resolve(targetPath);
+
+  try {
+    if (fs.existsSync(resolved)) {
+      fs.accessSync(resolved, fs.constants.W_OK);
+      return true;
+    }
+
+    const ancestor = findExistingAncestor(resolved);
+    fs.accessSync(ancestor, fs.constants.W_OK);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+function ensureWritableTarget(commandName) {
+  if (!WRITE_COMMANDS.has(commandName)) {
+    return;
+  }
+
+  const globalOptions = program.opts();
+  const targetPath = resolveConfigTarget(globalOptions);
+
+  if (!globalOptions.config && !process.env.KUBEDIFY_CONFIG_HOME) {
+    process.env.KUBEDIFY_CONFIG_HOME = targetPath;
+  }
+
+  if (isWritablePath(targetPath)) {
+    return;
+  }
+
+  if (globalOptions.config) {
+    throw new Error(
+      `Cannot write to the configuration path ${targetPath}. Ensure the file or its parent directory is writable, or choose another path.`,
+    );
+  }
+
+  throw new Error(
+    `Kubedify cannot write to ${targetPath}. Set KUBEDIFY_CONFIG_HOME or rerun with --config <path> pointing to a writable location.`,
+  );
+}
+
+function warnIfInstallDirNotWritable() {
+  if (installDirWritableWarningShown) {
+    return;
+  }
+  try {
+    fs.accessSync(deployScriptDir, fs.constants.W_OK);
+  } catch (error) {
+    installDirWritableWarningShown = true;
+    console.warn(
+      chalk.yellow(
+        `Install directory ${deployScriptDir} is read-only. Profiles are stored under your user config directory (e.g. ${resolveConfigTarget(program.opts())}). Use --config <path> to point to a different writable location if needed.`,
+      ),
+    );
+  }
+}
 
 const WELCOME_ART = [
   ".─. .─')             .─. .─')    ('─.  _ .─') _                                 ",
@@ -261,6 +379,8 @@ function forwardSignals(child) {
 
 async function runDeployCommand(commandName, commandArgs, spinnerText) {
   ensureDeployScript();
+  warnIfInstallDirNotWritable();
+  ensureWritableTarget(commandName);
   const invocation = buildInvocation(commandName, commandArgs);
   const resolvedSpinnerText = spinnerText || `Running ${commandName}...`;
   const spinner = ora({ text: resolvedSpinnerText, color: 'cyan' }).start();
@@ -362,14 +482,14 @@ program
 
 program
   .command('set-docker-username <value>')
-  .description('Shortcut for setting DOCKER_USERNAME')
+  .description('Store DOCKER_USERNAME in the active profile secrets file')
   .action(function (value) {
     return runDeployCommand('set-docker-username', [value], 'Updating DOCKER_USERNAME...');
   });
 
 program
   .command('set-docker-pat <value>')
-  .description('Shortcut for setting DOCKER_PAT')
+  .description('Store DOCKER_PAT in the active profile secrets file')
   .action(function (value) {
     return runDeployCommand('set-docker-pat', [value], 'Updating DOCKER_PAT...');
   });
