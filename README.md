@@ -1,3 +1,14 @@
+```
+.─. .─')             .─. .─')    ('─.  _ .─') _                                  
+╲  ( OO )            ╲  ( OO ) _(  OO)( (  OO) )                                 
+,──. ,──. ,──. ,──.   ;─────.╲(,──────.╲     .'_   ,─.─')    ,──────. ,──.   ,──.
+│  .'   ╱ │  │ │  │   │ .─.  │ │  .───',`'──..._)  │  │OO)('─│ _.───'  ╲  `.'  ╱ 
+│      ╱, │  │ │ .─') │ '─' ╱_)│  │    │  │  ╲  '  │  │  ╲(OO│(_╲    .─')     ╱  
+│     ' _)│  │_│( OO )│ .─. `.(│  '──. │  │   ' │  │  │(_╱╱  │  '──.(OO  ╲   ╱   
+│  .   ╲  │  │ │ `─' ╱│ │  ╲  ││  .──' │  │   ╱ : ,│  │_.'╲_)│  .──' │   ╱  ╱╲_  
+│  │╲   ╲('  '─'(_.─' │ '──'  ╱│  `───.│  '──'  ╱(_│  │     ╲│  │_)  `─.╱  ╱.__) 
+`──' '──'  `─────'    `──────' `──────'`───────'   `──'      `──'      `──'      
+```
 # KubeDify: Kubernetes Dify Installer For You
 
 This repository provides `deploy-kind.sh`, a helper for installing the Dify Helm chart into a local [Kind](https://kind.sigs.k8s.io/) cluster. The script wraps the end-to-end workflow—cluster creation, PVC management, registry secrets, and Helm installation—behind a small CLI so you can move between versions quickly and keep all configuration in a single JSON file.
@@ -121,5 +132,3 @@ Values may be left empty when you want the script to fall back to sane defaults 
 - The prepared values snapshot stored in `log/` helps reproduce the exact settings used for a deployment.
 - When experimenting with multiple environments, create dedicated profiles (for example, `profile create dev`) and switch between them with `profile use <name>`; use `--profile <name>` when you want a one-off override without changing the default.
 - If you switch Docker credentials, rerun `set-docker-username` and `set-docker-pat` before installing to refresh the image pull secret.
-
-For deeper background on the deployment flow, refer to `agent.md`.
