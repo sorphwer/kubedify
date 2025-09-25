@@ -18,6 +18,8 @@
 
 ## Quick Start
 
+> Default enterprise image is : dify-enterprise-dev:0.11.3-arm64 , prepare yours in your local images or config it in ` ~/.config/kubedify `
+
 ```bash
 npm install -g kubedify
 #kubedify profile create dev
