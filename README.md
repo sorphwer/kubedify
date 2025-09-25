@@ -11,7 +11,7 @@
 ```
 # KubeDify: Kubernetes Dify Installer For You
 
-This repository provides `kubedify`, a Node.js CLI that wraps the underlying `deploy-kind.sh` automation for installing the Dify Helm chart into a local [Kind](https://kind.sigs.k8s.io/) cluster. The toolkit handles the end-to-end workflow—cluster creation, PVC management, registry secrets, and Helm installation—so you can move between versions quickly while keeping environment configuration in JSON profiles.
+![2025-09-25 14 09 19](https://github.com/user-attachments/assets/8b9e3774-8bfb-4f58-a9c5-69d040ea4f13)
 
 ## Quick Start
 
