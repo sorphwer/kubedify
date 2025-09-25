@@ -11,7 +11,10 @@
 ```
 # KubeDify: Kubernetes Dify Installer For You
 
-![2025-09-25 14 09 19](https://github.com/user-attachments/assets/8b9e3774-8bfb-4f58-a9c5-69d040ea4f13)
+- Install Dify on a k8s with one line command `kubedify install`
+- You can run `kubedify install 3.5.0` and rerun it!
+- You can run `kubedify install 3.4.1` and just run `kubedify install 3.5.2` , the swtich will be smooth since each version has own PV
+- All operations are in your Kind container, you can just delete this container to remove anything
 
 ## Quick Start
 
