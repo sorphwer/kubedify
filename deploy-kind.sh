@@ -2,7 +2,17 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd)
-CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/config.json}"
+CONFIG_DIR="${SCRIPT_DIR}/profiles"
+PROFILE_STATE_FILE="${SCRIPT_DIR}/.config-profile"
+DEFAULT_PROFILE_NAME="default"
+
+INITIAL_CONFIG_FILE="${CONFIG_FILE:-}"
+CONFIG_FILE_OVERRIDE=""
+PROFILE_OVERRIDE=""
+PROFILE_STATE_WRITABLE=true
+CONFIG_FILE=""
+PROFILE_DIR=""
+ACTIVE_PROFILE=""
 DRY_RUN=false
 INSTALL_VERSION_OVERRIDE=""
 ACTION=""
@@ -11,18 +21,23 @@ declare -a CLEANUP_FILES=()
 
 usage() {
   cat <<'USAGE'
-Usage: deploy-kind.sh [--config <path>] <command> [args]
+Usage: deploy-kind.sh [--config <path>] [--profile <name>] <command> [args]
 
 Commands:
   install [version] [--dry-run]   Deploy the chart, optionally pinning the chart version.
-  set <KEY> <VALUE...>            Update a configuration entry in config.json.
+  set <KEY> <VALUE...>            Update a configuration entry in the active config.
   set-docker-username <VALUE>     Shortcut for setting DOCKER_USERNAME.
   set-docker-pat <VALUE>          Shortcut for setting DOCKER_PAT.
   list                            List available chart versions from the configured Helm repo.
   current                         Show the last recorded installed chart version.
+  show                            Print the active configuration JSON.
+  profile list                    List known profiles (the active one is marked with *).
+  profile create <name>           Create a new profile configuration from the example template.
+  profile use <name>              Switch the default profile used by subsequent runs.
 
 Options:
-  --config <path>                 Override the path to config.json (default: alongside the script).
+  --config <path>                 Provide an explicit config path (disables profile management).
+  --profile <name>                Temporarily use the given profile for this invocation.
   -h, --help                      Show this help.
 USAGE
 }
@@ -34,7 +49,17 @@ while [[ $# -gt 0 ]]; do
         echo "Missing value for --config" >&2
         exit 1
       fi
-      CONFIG_FILE="$2"
+      CONFIG_FILE_OVERRIDE="$2"
+      PROFILE_STATE_WRITABLE=false
+      shift 2
+      ;;
+    --profile)
+      if [[ $# -lt 2 ]]; then
+        echo "Missing value for --profile" >&2
+        exit 1
+      fi
+      PROFILE_OVERRIDE="$2"
+      PROFILE_STATE_WRITABLE=false
       shift 2
       ;;
     -h|--help)
@@ -50,6 +75,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -z "$CONFIG_FILE_OVERRIDE" && -n "$INITIAL_CONFIG_FILE" ]]; then
+  CONFIG_FILE_OVERRIDE="$INITIAL_CONFIG_FILE"
+  PROFILE_STATE_WRITABLE=false
+fi
 
 if [[ $# -gt 0 ]]; then
   COMMAND="$1"
@@ -83,6 +113,14 @@ case "$COMMAND" in
     ACTION="current"
     ACTION_ARGS=("$@")
     ;;
+  show)
+    ACTION="show"
+    ACTION_ARGS=("$@")
+    ;;
+  profile)
+    ACTION="profile"
+    ACTION_ARGS=("$@")
+    ;;
   -h|--help)
     usage
     exit 0
@@ -95,7 +133,6 @@ case "$COMMAND" in
 esac
 
 cd "$SCRIPT_DIR"
-
 log() {
   printf '[%s] %s
 ' "$(date '+%H:%M:%S')" "$1"
@@ -120,11 +157,187 @@ require_cmd() {
   fi
 }
 
-ensure_config() {
-  if [[ ! -f "$CONFIG_FILE" ]]; then
-    die "Config file not found: $CONFIG_FILE"
+ensure_profiles_dir() {
+  mkdir -p "$CONFIG_DIR"
+}
+
+validate_profile_name() {
+  local name="$1"
+  if [[ -z "$name" ]]; then
+    die "Profile name must not be empty"
+  fi
+  if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    die "Profile name '$name' may only contain letters, numbers, '.', '_' and '-'"
   fi
 }
+
+profile_dir_for_name() {
+  local name="$1"
+  printf '%s/%s' "$CONFIG_DIR" "$name"
+}
+
+config_path_for_profile() {
+  local name="$1"
+  printf '%s/config.json' "$(profile_dir_for_name "$name")"
+}
+
+values_path_for_profile() {
+  local name="$1"
+  printf '%s/values.yaml' "$(profile_dir_for_name "$name")"
+}
+
+migrate_legacy_profile_structure() {
+  local name="$1"
+  local legacy_config="${CONFIG_DIR}/${name}.json"
+  local profile_dir
+  profile_dir=$(profile_dir_for_name "$name")
+  local target_config="$profile_dir/config.json"
+  if [[ -f "$legacy_config" ]]; then
+    mkdir -p "$profile_dir"
+    mv "$legacy_config" "$target_config"
+    log "Moved legacy profile '${name}' config to ${target_config}"
+  fi
+}
+
+migrate_legacy_default_assets() {
+  local target_config=$(config_path_for_profile "$DEFAULT_PROFILE_NAME")
+  local target_dir
+  target_dir=$(profile_dir_for_name "$DEFAULT_PROFILE_NAME")
+  local legacy_config="${SCRIPT_DIR}/config.json"
+  if [[ -f "$legacy_config" && ! -f "$target_config" ]]; then
+    mkdir -p "$target_dir"
+    mv "$legacy_config" "$target_config"
+    log "Moved legacy config.json to ${target_config}"
+  fi
+  local target_values=$(values_path_for_profile "$DEFAULT_PROFILE_NAME")
+  local legacy_values="${SCRIPT_DIR}/values.yaml"
+  if [[ -f "$legacy_values" && ! -f "$target_values" ]]; then
+    mkdir -p "$target_dir"
+    mv "$legacy_values" "$target_values"
+    log "Moved legacy values.yaml to ${target_values}"
+  fi
+}
+
+current_profile_from_state() {
+  if [[ ! -f "$PROFILE_STATE_FILE" ]]; then
+    return 0
+  fi
+  local value
+  value=$(<"$PROFILE_STATE_FILE")
+  value=${value%$'\r'}
+  value=${value%$'\n'}
+  printf '%s' "$value"
+}
+
+write_profile_state() {
+  if [[ "$PROFILE_STATE_WRITABLE" != true ]]; then
+    return
+  fi
+  [[ -n "$ACTIVE_PROFILE" ]] || return
+  printf '%s\n' "$ACTIVE_PROFILE" >"$PROFILE_STATE_FILE"
+}
+
+bootstrap_profile_dir() {
+  local name="$1"
+  migrate_legacy_profile_structure "$name"
+  local dir
+  dir=$(profile_dir_for_name "$name")
+  local config="$dir/config.json"
+  local values="$dir/values.yaml"
+  mkdir -p "$dir"
+
+  if [[ ! -f "$config" ]]; then
+    if [[ "$name" != "$DEFAULT_PROFILE_NAME" && -f "$(config_path_for_profile "$DEFAULT_PROFILE_NAME")" ]]; then
+      cp "$(config_path_for_profile "$DEFAULT_PROFILE_NAME")" "$config"
+    elif [[ -f "$SCRIPT_DIR/config.example.json" ]]; then
+      cp "$SCRIPT_DIR/config.example.json" "$config"
+    else
+      printf '{}\n' >"$config"
+    fi
+    log "Created config for profile '${name}' at ${config}"
+  fi
+
+  if [[ ! -f "$values" ]]; then
+    if [[ "$name" != "$DEFAULT_PROFILE_NAME" && -f "$(values_path_for_profile "$DEFAULT_PROFILE_NAME")" ]]; then
+      cp "$(values_path_for_profile "$DEFAULT_PROFILE_NAME")" "$values"
+    elif [[ -f "$SCRIPT_DIR/values.example.yaml" ]]; then
+      cp "$SCRIPT_DIR/values.example.yaml" "$values"
+    elif [[ -f "$SCRIPT_DIR/values.yaml" ]]; then
+      cp "$SCRIPT_DIR/values.yaml" "$values"
+    else
+      printf '# add chart overrides here\n' >"$values"
+    fi
+    log "Created values file for profile '${name}' at ${values}"
+  fi
+}
+
+ensure_profile_config_exists() {
+  local target="$1"
+  local profile="$2"
+  if [[ -z "$profile" ]]; then
+    if [[ ! -f "$target" ]]; then
+      if [[ -f "$SCRIPT_DIR/config.example.json" ]]; then
+        cp "$SCRIPT_DIR/config.example.json" "$target"
+        log "Created config at ${target} from config.example.json"
+      else
+        printf '{}\n' >"$target"
+        log "Created empty config at ${target}"
+      fi
+    fi
+    return
+  fi
+  bootstrap_profile_dir "$profile"
+}
+
+init_profile_environment() {
+  ensure_profiles_dir
+  migrate_legacy_default_assets
+  if [[ -n "$CONFIG_FILE_OVERRIDE" ]]; then
+    CONFIG_FILE="$CONFIG_FILE_OVERRIDE"
+    PROFILE_DIR=$(dirname "$CONFIG_FILE")
+    ACTIVE_PROFILE=""
+    return
+  fi
+
+  local selected=""
+  if [[ -n "$PROFILE_OVERRIDE" ]]; then
+    selected="$PROFILE_OVERRIDE"
+  else
+    selected=$(current_profile_from_state)
+  fi
+  if [[ -z "$selected" ]]; then
+    selected="$DEFAULT_PROFILE_NAME"
+  fi
+  validate_profile_name "$selected"
+  ACTIVE_PROFILE="$selected"
+  bootstrap_profile_dir "$ACTIVE_PROFILE"
+  PROFILE_DIR=$(profile_dir_for_name "$ACTIVE_PROFILE")
+  CONFIG_FILE=$(config_path_for_profile "$ACTIVE_PROFILE")
+  write_profile_state
+}
+
+ensure_config_for_writing() {
+  if [[ -n "$CONFIG_FILE_OVERRIDE" ]]; then
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    ensure_profile_config_exists "$CONFIG_FILE" ""
+    return
+  fi
+  ensure_profile_config_exists "$CONFIG_FILE" "$ACTIVE_PROFILE"
+  write_profile_state
+}
+
+ensure_config() {
+  if [[ -n "$CONFIG_FILE_OVERRIDE" ]]; then
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+      die "Config file not found: $CONFIG_FILE"
+    fi
+    return
+  fi
+  ensure_profile_config_exists "$CONFIG_FILE" "$ACTIVE_PROFILE"
+  write_profile_state
+}
+
+init_profile_environment
 
 load_config() {
   ensure_config
@@ -162,6 +375,7 @@ PYCFG
 set_config_value() {
   local key="$1"
   local value="$2"
+  ensure_config_for_writing
   require_cmd python3
   python3 - "$CONFIG_FILE" "$key" "$value" <<'PYSET'
 import json
@@ -276,6 +490,32 @@ handle_current_command() {
   fi
 }
 
+handle_show_command() {
+  if ((${#ACTION_ARGS[@]} > 0)); then
+    die "show command does not accept additional arguments"
+  fi
+  ensure_config
+  require_cmd python3
+  if [[ -n "$ACTIVE_PROFILE" ]]; then
+    echo "Active profile: $ACTIVE_PROFILE"
+  fi
+  echo "Config path: $CONFIG_FILE"
+  python3 - "$CONFIG_FILE" <<'PYSHOW'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text().strip()
+if not text:
+    data = {}
+else:
+    data = json.loads(text)
+
+print(json.dumps(data, indent=2, sort_keys=True))
+PYSHOW
+}
+
 handle_list_command() {
   if ((${#ACTION_ARGS[@]} > 0)); then
     die "list command does not accept additional arguments"
@@ -293,6 +533,128 @@ handle_list_command() {
   fi
   "$helm_cmd" repo update >/dev/null 2>&1 || true
   "$helm_cmd" search repo "$HELM_CHART" --versions
+}
+
+profile_list() {
+  ensure_profiles_dir
+  shopt -s nullglob
+  for legacy in "$CONFIG_DIR"/*.json; do
+    local legacy_name
+    legacy_name=$(basename "$legacy" .json)
+    migrate_legacy_profile_structure "$legacy_name"
+    [[ -n "$legacy_name" ]] && bootstrap_profile_dir "$legacy_name"
+  done
+  shopt -u nullglob
+
+  bootstrap_profile_dir "$DEFAULT_PROFILE_NAME"
+
+  local active="$ACTIVE_PROFILE"
+  if [[ -n "$CONFIG_FILE_OVERRIDE" || -n "$PROFILE_OVERRIDE" ]]; then
+    active=$(current_profile_from_state)
+  fi
+  if [[ -z "$active" ]]; then
+    active="$DEFAULT_PROFILE_NAME"
+  fi
+
+  local names=()
+  if [[ -d "$(profile_dir_for_name "$DEFAULT_PROFILE_NAME")" ]]; then
+    names+=("$DEFAULT_PROFILE_NAME")
+  fi
+  shopt -s nullglob
+  for dir in "$CONFIG_DIR"/*; do
+    [[ -d "$dir" ]] || continue
+    local base
+    base=$(basename "$dir")
+    [[ "$base" == "$DEFAULT_PROFILE_NAME" ]] && continue
+    names+=("$base")
+  done
+  shopt -u nullglob
+
+  if ((${#names[@]} == 0)); then
+    echo "No profiles found."
+    return
+  fi
+
+  local name
+  for name in "${names[@]}"; do
+    local marker=" "
+    if [[ -n "$active" && "$name" == "$active" ]]; then
+      marker="*"
+    fi
+    printf '%s %s (%s)\n' "$marker" "$name" "$(config_path_for_profile "$name")"
+  done
+  echo "[* denotes the active profile]"
+}
+
+profile_create() {
+  local name="$1"
+  if [[ -z "$name" ]]; then
+    die "Usage: deploy-kind.sh profile create <name>"
+  fi
+  validate_profile_name "$name"
+  if [[ "$name" == "$DEFAULT_PROFILE_NAME" ]]; then
+    die "Profile '$name' already exists"
+  fi
+  local dir
+  dir=$(profile_dir_for_name "$name")
+  if [[ -d "$dir" ]]; then
+    die "Profile '$name' already exists at $dir"
+  fi
+  bootstrap_profile_dir "$name"
+}
+
+profile_use() {
+  local name="$1"
+  if [[ -z "$name" ]]; then
+    die "Usage: deploy-kind.sh profile use <name>"
+  fi
+  validate_profile_name "$name"
+  migrate_legacy_profile_structure "$name"
+  local dir
+  dir=$(profile_dir_for_name "$name")
+  local path
+  path=$(config_path_for_profile "$name")
+  if [[ "$name" == "$DEFAULT_PROFILE_NAME" ]]; then
+    bootstrap_profile_dir "$DEFAULT_PROFILE_NAME"
+  fi
+  if [[ ! -f "$path" ]]; then
+    bootstrap_profile_dir "$name"
+  fi
+  if [[ ! -f "$path" ]]; then
+    die "Profile '$name' does not exist. Run 'deploy-kind.sh profile create $name' first."
+  fi
+  ACTIVE_PROFILE="$name"
+  CONFIG_FILE="$path"
+  PROFILE_DIR="$dir"
+  CONFIG_FILE_OVERRIDE=""
+  PROFILE_OVERRIDE=""
+  PROFILE_STATE_WRITABLE=true
+  write_profile_state
+  log "Switched active profile to '$name' (${path})"
+}
+
+handle_profile_command() {
+  if [[ -n "$CONFIG_FILE_OVERRIDE" ]]; then
+    die "Profile management is unavailable when --config is supplied"
+  fi
+  if ((${#ACTION_ARGS[@]} == 0)); then
+    die "Usage: deploy-kind.sh profile <list|create|use> [...]"
+  fi
+  local subcommand="${ACTION_ARGS[0]}"
+  case "$subcommand" in
+    list)
+      profile_list
+      ;;
+    create)
+      profile_create "${ACTION_ARGS[1]:-}"
+      ;;
+    use)
+      profile_use "${ACTION_ARGS[1]:-}"
+      ;;
+    *)
+      die "Unknown profile subcommand: $subcommand"
+      ;;
+  esac
 }
 
 record_install_metadata() {
@@ -347,6 +709,7 @@ install_flow() {
   HELM_REPO_NAME=${HELM_REPO_NAME:-}
   HELM_REPO_URL=${HELM_REPO_URL:-}
   HELM_ADDITIONAL_ARGS=${HELM_ADDITIONAL_ARGS:-}
+  HELM_TIMEOUT=${HELM_TIMEOUT:-10m}
   DOCKER_USERNAME=${DOCKER_USERNAME:-}
   DOCKER_PAT=${DOCKER_PAT:-}
   IMAGE_REGISTRY_SERVER=${IMAGE_REGISTRY_SERVER:-https://index.docker.io/v1/}
@@ -378,13 +741,23 @@ install_flow() {
   require_cmd kind
   require_cmd kubectl
 
-  if [[ -f "$HELM_VALUES_FILE" ]]; then
-    HELM_VALUES_PATH="$HELM_VALUES_FILE"
-  elif [[ -f "${SCRIPT_DIR}/$HELM_VALUES_FILE" ]]; then
-    HELM_VALUES_PATH="${SCRIPT_DIR}/$HELM_VALUES_FILE"
-  else
-    die "Helm values file not found: $HELM_VALUES_FILE"
+  local values_reference="${HELM_VALUES_FILE:-}"
+  if [[ -z "$values_reference" ]]; then
+    values_reference="values.yaml"
   fi
+  local resolved_values=""
+  if [[ -f "$values_reference" ]]; then
+    resolved_values="$values_reference"
+  elif [[ "$values_reference" != /* && -n "$PROFILE_DIR" && -f "$PROFILE_DIR/$values_reference" ]]; then
+    resolved_values="$PROFILE_DIR/$values_reference"
+  elif [[ "$values_reference" != /* && -f "${SCRIPT_DIR}/$values_reference" ]]; then
+    resolved_values="${SCRIPT_DIR}/$values_reference"
+  fi
+
+  if [[ -z "$resolved_values" ]]; then
+    die "Helm values file not found: $values_reference"
+  fi
+  HELM_VALUES_PATH="$resolved_values"
 
   if $DRY_RUN; then
     log "Dry-run enabled; commands will not be executed."
@@ -959,6 +1332,7 @@ deploy_helm_chart() {
     --namespace "$HELM_NAMESPACE"
     --kube-context "$K8S_CONTEXT"
     --values "$PREPARED_HELM_VALUES_PATH"
+    --timeout "$HELM_TIMEOUT"
   )
   if [[ -n "$HELM_CHART_VERSION_OVERRIDE" ]]; then
     helm_cmd+=(--version "$HELM_CHART_VERSION_OVERRIDE")
@@ -995,6 +1369,12 @@ case "$ACTION" in
     ;;
   current)
     handle_current_command
+    ;;
+  show)
+    handle_show_command
+    ;;
+  profile)
+    handle_profile_command
     ;;
   install)
     install_flow

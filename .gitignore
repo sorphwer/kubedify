@@ -1,6 +1,7 @@
 /log/*
-tt
 .bin/*
-.env.kind.*
-config.json
+profiles/*
+!profiles/default/*
+.config-profile
 .DS_Store
+

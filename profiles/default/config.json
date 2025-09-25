@@ -31,6 +31,7 @@
   "HELM_REPO_NAME": "dify",
   "HELM_REPO_URL": "https://langgenius.github.io/dify-helm",
   "HELM_ADDITIONAL_ARGS": "",
+  "HELM_TIMEOUT": "15m",
   "IMAGE_REGISTRY_SERVER": "https://index.docker.io/v1/",
   "IMAGE_REGISTRY_USERNAME": "",
   "IMAGE_REGISTRY_PASSWORD": "",
