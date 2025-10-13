@@ -209,6 +209,92 @@ run_cmd() {
   fi
 }
 
+get_local_lan_ip() {
+  local ip=""
+  
+  # Try different methods based on OS
+  if [[ "$OSTYPE" == darwin* ]]; then
+    # macOS: get IP from en0 (WiFi) or en1 (Ethernet)
+    ip=$(ifconfig | grep -A 1 'en0' | grep 'inet ' | awk '{print $2}' | head -n1)
+    if [[ -z "$ip" ]]; then
+      ip=$(ifconfig | grep -A 1 'en1' | grep 'inet ' | awk '{print $2}' | head -n1)
+    fi
+  else
+    # Linux: use ip command or fallback to ifconfig
+    if command -v ip >/dev/null 2>&1; then
+      ip=$(ip route get 8.8.8.8 | grep -oP 'src \K\S+' 2>/dev/null || true)
+    fi
+    if [[ -z "$ip" ]] && command -v ifconfig >/dev/null 2>&1; then
+      ip=$(ifconfig | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | head -n1 | sed 's/addr://')
+    fi
+  fi
+  
+  # Validate IP format
+  if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf '%s' "$ip"
+    return 0
+  fi
+  
+  return 1
+}
+
+ensure_local_registry() {
+  local registry_port="${LOCAL_REGISTRY_PORT:-17488}"
+  local registry_name="${LOCAL_REGISTRY_NAME:-kind-registry}"
+  
+  # Check if registry container already exists and is running
+  if docker ps --format '{{.Names}}' | grep -q "^${registry_name}$"; then
+    log "Local registry '${registry_name}' is already running on port ${registry_port}"
+    return 0
+  fi
+  
+  # Check if container exists but is stopped
+  if docker ps -a --format '{{.Names}}' | grep -q "^${registry_name}$"; then
+    log "Starting existing local registry '${registry_name}'"
+    if $DRY_RUN; then
+      log "DRY-RUN: docker start ${registry_name}"
+    else
+      docker start "$registry_name" || die "Failed to start local registry"
+    fi
+    return 0
+  fi
+  
+  # Create new registry container
+  log "Creating local registry '${registry_name}' on port ${registry_port}"
+  if $DRY_RUN; then
+    log "DRY-RUN: docker run -d --restart=always -p ${registry_port}:5000 --name ${registry_name} registry:2"
+  else
+    docker run -d --restart=always \
+      -p "${registry_port}:5000" \
+      --name "${registry_name}" \
+      registry:2 || die "Failed to create local registry"
+  fi
+  
+  log "Local registry '${registry_name}' is now running on port ${registry_port}"
+}
+
+connect_registry_to_kind() {
+  local registry_name="${LOCAL_REGISTRY_NAME:-kind-registry}"
+  local kind_network="kind"
+  
+  # Check if registry is connected to kind network
+  local network_connected
+  network_connected=$(docker inspect "$registry_name" --format '{{range $net, $v := .NetworkSettings.Networks}}{{$net}} {{end}}' 2>/dev/null || true)
+  
+  if [[ "$network_connected" == *"kind"* ]]; then
+    log "Registry already connected to kind network"
+    return 0
+  fi
+  
+  # Connect registry to kind network
+  log "Connecting registry to kind network"
+  if $DRY_RUN; then
+    log "DRY-RUN: docker network connect ${kind_network} ${registry_name}"
+  else
+    docker network connect "$kind_network" "$registry_name" 2>/dev/null || true
+  fi
+}
+
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     die "Missing required command: $1"
@@ -1147,8 +1233,23 @@ install_flow() {
   POSTGRES_PVC_ANNOTATIONS=${POSTGRES_PVC_ANNOTATIONS:-${PVC_ANNOTATIONS:-}}
   IMAGE_REPO_SECRET_NAME=${IMAGE_REPO_SECRET_NAME:-image-repo-secret}
   IMAGE_REGISTRY_EMAIL=${IMAGE_REGISTRY_EMAIL:-unused@example.com}
-  IMAGE_REPO_PREFIX=${IMAGE_REPO_PREFIX:-"docker.io/${DOCKER_USERNAME:-}"}
+  LOCAL_REGISTRY_PORT=${LOCAL_REGISTRY_PORT:-17488}
+  LOCAL_REGISTRY_NAME=${LOCAL_REGISTRY_NAME:-kind-registry}
+  
+  # Setup local registry and get LAN IP
+  log "Setting up local Docker registry..."
+  ensure_local_registry
+  
+  local lan_ip
+  if ! lan_ip=$(get_local_lan_ip); then
+    die "Failed to detect local LAN IP address. Please set IMAGE_REPO_PREFIX manually."
+  fi
+  log "Detected local LAN IP: ${lan_ip}"
+  
+  IMAGE_REPO_PREFIX=${IMAGE_REPO_PREFIX:-"${lan_ip}:${LOCAL_REGISTRY_PORT}"}
   IMAGE_REPO_TYPE=${IMAGE_REPO_TYPE:-docker}
+  log "Using IMAGE_REPO_PREFIX: ${IMAGE_REPO_PREFIX}"
+  
   INGRESS_CONTROLLER_MANIFEST=${INGRESS_CONTROLLER_MANIFEST:-https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml}
   LOCAL_DOCKER_IMAGES=${LOCAL_DOCKER_IMAGES:-}
   local resolved_values_log_dir=""
@@ -1620,12 +1721,87 @@ detect_kind_architecture() {
   esac
 }
 
+is_enterprise_in_dev_mode() {
+  local values_path="$1"
+  local expected_repo="$2"
+  local expected_tag="$3"
+  
+  # Check if repository matches expected dev repo
+  local current_repo
+  current_repo=$(grep -A 5 '^enterprise:' "$values_path" | grep -A 3 '^  image:' | grep '    repository:' | awk '{print $2}' || true)
+  
+  if [[ "$current_repo" != "$expected_repo" ]]; then
+    return 1
+  fi
+  
+  # Check if tag exists and matches
+  local current_tag
+  current_tag=$(grep -A 5 '^enterprise:' "$values_path" | grep -A 3 '^  image:' | grep '    tag:' | awk '{print $2}' | tr -d '"' || true)
+  
+  if [[ "$current_tag" != "$expected_tag" ]]; then
+    return 1
+  fi
+  
+  # Check if pullPolicy exists
+  if ! grep -A 5 '^enterprise:' "$values_path" | grep -A 3 '^  image:' | grep -q '    pullPolicy:'; then
+    return 1
+  fi
+  
+  # Check if licenseServer exists
+  if ! grep -A 20 '^enterprise:' "$values_path" | grep -q '^  licenseServer:'; then
+    return 1
+  fi
+  
+  # All checks passed - already in dev mode
+  return 0
+}
+
+is_enterprise_in_default_mode() {
+  local values_path="$1"
+  
+  # Check if repository is default (langgenius/dify-enterprise)
+  local current_repo
+  current_repo=$(grep -A 5 '^enterprise:' "$values_path" | grep -A 3 '^  image:' | grep '    repository:' | awk '{print $2}' || true)
+  
+  if [[ "$current_repo" != "langgenius/dify-enterprise" ]]; then
+    return 1
+  fi
+  
+  # Check that tag does NOT exist
+  if grep -A 5 '^enterprise:' "$values_path" | grep -A 3 '^  image:' | grep -q '    tag:'; then
+    return 1
+  fi
+  
+  # Check that pullPolicy does NOT exist
+  if grep -A 5 '^enterprise:' "$values_path" | grep -A 3 '^  image:' | grep -q '    pullPolicy:'; then
+    return 1
+  fi
+  
+  # Check that licenseServer does NOT exist
+  if grep -A 20 '^enterprise:' "$values_path" | grep -q '^  licenseServer:'; then
+    return 1
+  fi
+  
+  # All checks passed - already in default mode
+  return 0
+}
+
 update_enterprise_dev_config() {
   local values_path="$1"
   local repository="$2"
   local tag="$3"
   local pull_policy="$4"
   local license_server="${5:-https://license.dify.dev/server}"
+  
+  # Check if already in dev mode
+  if is_enterprise_in_dev_mode "$values_path" "$repository" "$tag"; then
+    log "Enterprise configuration is already in dev mode - skipping update"
+    log "  Repository: ${repository}"
+    log "  Tag: ${tag}"
+    log "  PullPolicy: ${pull_policy}"
+    log "  LicenseServer: ${license_server}"
+    return 0
+  fi
 
   # Step 1: Update repository
   sed -i.bak '/^enterprise:/,/^[a-z]/ {
@@ -1695,6 +1871,14 @@ update_enterprise_dev_config() {
 
 restore_enterprise_default_config() {
   local values_path="$1"
+  
+  # Check if already in default mode
+  if is_enterprise_in_default_mode "$values_path"; then
+    log "Enterprise configuration is already in default mode - skipping restore"
+    log "  Repository: langgenius/dify-enterprise"
+    log "  No dev-specific fields present"
+    return 0
+  fi
   
   # Step 1: Restore repository to default (langgenius/dify-enterprise)
   sed -i.bak '/^enterprise:/,/^[a-z]/ {
@@ -2036,7 +2220,36 @@ ensure_kind_cluster() {
 
   local tmp_config
   tmp_config=$(mktemp)
-  cat >"$tmp_config" <<CFG
+  
+  # Get local LAN IP for registry configuration
+  local registry_ip
+  if registry_ip=$(get_local_lan_ip); then
+    local registry_port="${LOCAL_REGISTRY_PORT:-17488}"
+    cat >"$tmp_config" <<CFG
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  extraPortMappings:
+  - containerPort: 80
+    hostPort: ${KIND_HTTP_PORT:-80}
+    protocol: TCP
+  - containerPort: 443
+    hostPort: ${KIND_HTTPS_PORT:-443}
+    protocol: TCP
+  - containerPort: 5432
+    hostPort: ${KIND_POSTGRES_PORT:-5432}
+    protocol: TCP
+containerdConfigPatches:
+- |-
+  [plugins."io.containerd.grpc.v1.cri".registry.mirrors."${registry_ip}:${registry_port}"]
+    endpoint = ["http://${LOCAL_REGISTRY_NAME:-kind-registry}:5000"]
+  [plugins."io.containerd.grpc.v1.cri".registry.configs."${LOCAL_REGISTRY_NAME:-kind-registry}:5000".tls]
+    insecure_skip_verify = true
+CFG
+  else
+    # Fallback without registry configuration
+    cat >"$tmp_config" <<CFG
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
@@ -2052,6 +2265,7 @@ nodes:
     hostPort: ${KIND_POSTGRES_PORT:-5432}
     protocol: TCP
 CFG
+  fi
 
   if $DRY_RUN; then
     log "DRY-RUN: kind create cluster --name ${KIND_CLUSTER_NAME} --config ${tmp_config}"
@@ -2199,6 +2413,7 @@ deploy_helm_chart() {
 
 main() {
   ensure_kind_cluster
+  connect_registry_to_kind
   ensure_namespace
   install_ingress_controller
   load_local_images

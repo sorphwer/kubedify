@@ -240,6 +240,7 @@ plugin_connector:
   imageRepoSecret: "image-repo-secret"
   gatewayImage: "nginx:1.27.3"
   busyBoxImage: "busybox:latest"
+  insecureImageRepo: true
 
 gateway:
   replicas: 1
