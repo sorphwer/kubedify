@@ -83,6 +83,7 @@ Commands:
   list                            List available chart versions from the configured Helm repo.
   current                         Show the last recorded installed chart version.
   show                            Print the active configuration JSON.
+  debed                           Restore enterprise configuration to default (remove dev mode).
   profile list                    List known profiles (the active one is marked with *).
   profile create <name>           Create a new profile configuration from the example template.
   profile delete <name>           Delete a stored profile directory and its secrets.
@@ -172,6 +173,10 @@ case "$COMMAND" in
     ;;
   profile)
     ACTION="profile"
+    ACTION_ARGS=("$@")
+    ;;
+  debed)
+    ACTION="debed"
     ACTION_ARGS=("$@")
     ;;
   -h|--help)
@@ -743,6 +748,38 @@ handle_set_command() {
     value="$(printf '%s ' "${value_parts[@]}")"
     value="${value% }"
   fi
+
+  if [[ "$key" == "USE_ENTERPRISE_DEV" ]]; then
+    local normalized
+    normalized=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+    if [[ "$normalized" != "true" ]]; then
+      normalized="false"
+    fi
+
+    load_config
+
+    if [[ -z "${HELM_CHART:-}" ]]; then
+      HELM_CHART="dify/dify"
+    fi
+    HELM_VALUES_FILE=${HELM_VALUES_FILE:-values.yaml}
+    : "${KIND_CLUSTER_NAME:?KIND_CLUSTER_NAME must not be empty}"
+    if [[ -z "${K8S_CONTEXT:-}" ]]; then
+      K8S_CONTEXT="kind-${KIND_CLUSTER_NAME}"
+    fi
+    USE_ENTERPRISE_DEV="$normalized"
+
+    local values_path
+    if ! values_path=$(resolve_values_file_for_update); then
+      die "Unable to locate Helm values file to sync enterprise image overrides"
+    fi
+    HELM_VALUES_PATH="$values_path"
+
+    sync_enterprise_dev_mode "$normalized"
+    set_config_value "$key" "$normalized"
+    log "Updated ${key} in ${CONFIG_FILE}"
+    return
+  fi
+
   set_config_value "$key" "$value"
   log "Updated ${key} in ${CONFIG_FILE}"
 }
@@ -1178,6 +1215,7 @@ install_flow() {
   setup_helm_version
   resolve_helm_actual_version
   resolve_chart_version
+  sync_enterprise_dev_mode
   derive_pvc_name
   derive_pv_name
   derive_postgres_pvc_name
@@ -1342,6 +1380,421 @@ resolve_chart_version() {
   version=$(sanitize_dns_label "$version_raw")
   HELM_CHART_VERSION_EFFECTIVE="$version"
   log "Helm chart version detected: ${HELM_CHART_VERSION_EFFECTIVE:-unknown}"
+}
+
+resolve_values_file_for_update() {
+  local reference="${HELM_VALUES_FILE:-values.yaml}"
+
+  if [[ -n "${HELM_VALUES_PATH:-}" && -f "$HELM_VALUES_PATH" ]]; then
+    printf '%s' "$HELM_VALUES_PATH"
+    return 0
+  fi
+
+  if [[ "$reference" == /* && -f "$reference" ]]; then
+    printf '%s' "$reference"
+    return 0
+  fi
+
+  if [[ -n "${PROFILE_DIR:-}" && -f "${PROFILE_DIR}/${reference}" ]]; then
+    printf '%s' "${PROFILE_DIR}/${reference}"
+    return 0
+  fi
+
+  if [[ -f "$reference" ]]; then
+    printf '%s' "$reference"
+    return 0
+  fi
+
+  if [[ -f "${SCRIPT_DIR}/${reference}" ]]; then
+    printf '%s' "${SCRIPT_DIR}/${reference}"
+    return 0
+  fi
+
+  return 1
+}
+
+resolve_enterprise_chart_image() {
+  if [[ -n "${ENTERPRISE_CHART_IMAGE_REPOSITORY:-}" && -n "${ENTERPRISE_CHART_IMAGE_TAG:-}" ]]; then
+    return
+  fi
+
+  require_cmd helm
+  if [[ -z "${HELM_CMD:-}" ]]; then
+    HELM_CMD=$(command -v helm)
+  fi
+
+  local chart_repo="${HELM_CHART%%/*}"
+  if [[ -n "${HELM_REPO_NAME:-}" && -n "${HELM_REPO_URL:-}" && "$chart_repo" == "$HELM_REPO_NAME" ]]; then
+    if $DRY_RUN; then
+      log "DRY-RUN: ${HELM_CMD} repo add ${HELM_REPO_NAME} ${HELM_REPO_URL}"
+      log "DRY-RUN: ${HELM_CMD} repo update"
+    else
+      "$HELM_CMD" repo add "$HELM_REPO_NAME" "$HELM_REPO_URL" >/dev/null 2>&1 || true
+      "$HELM_CMD" repo update >/dev/null 2>&1 || true
+    fi
+  fi
+
+  local show_args=(show values "$HELM_CHART")
+  if [[ -n "${HELM_CHART_VERSION_OVERRIDE:-}" ]]; then
+    show_args+=(--version "$HELM_CHART_VERSION_OVERRIDE")
+  elif [[ -n "${HELM_CHART_VERSION:-}" && "${HELM_CHART_VERSION}" != "latest" ]]; then
+    show_args+=(--version "$HELM_CHART_VERSION")
+  fi
+
+  local values_output
+  if ! values_output=$("$HELM_CMD" "${show_args[@]}"); then
+    die "Failed to retrieve Helm values for ${HELM_CHART}"
+  fi
+
+  local enterprise_block
+  enterprise_block=$(printf '%s\n' "$values_output" | awk '
+    /^enterprise:/ {flag=1; next}
+    flag && /^[^[:space:]]/ {exit}
+    flag {print}
+  ')
+
+  local repository tag
+  repository=$(printf '%s\n' "$enterprise_block" | awk '
+    /repository:/ {
+      sub(/^[^:]*:[[:space:]]*/, "", $0);
+      gsub(/"/, "", $0);
+      print;
+      exit
+    }')
+  tag=$(printf '%s\n' "$enterprise_block" | awk '
+    /tag:/ {
+      sub(/^[^:]*:[[:space:]]*/, "", $0);
+      gsub(/"/, "", $0);
+      print;
+      exit
+    }')
+
+  if [[ -z "$repository" || -z "$tag" ]]; then
+    die "Unable to determine enterprise image repository/tag from Helm chart ${HELM_CHART}"
+  fi
+
+  ENTERPRISE_CHART_IMAGE_REPOSITORY="$repository"
+  ENTERPRISE_CHART_IMAGE_TAG="$tag"
+}
+
+normalize_image_list() {
+  local raw="$1"
+  local -a entries=()
+  IFS=',' read -ra entries <<< "$raw"
+  local -a trimmed=()
+  local entry
+  if ((${#entries[@]} > 0)); then
+    for entry in "${entries[@]}"; do
+      entry="${entry#${entry%%[![:space:]]*}}"
+      entry="${entry%${entry##*[![:space:]]}}"
+      [[ -z "$entry" ]] && continue
+      local exists=0
+      local current
+      if ((${#trimmed[@]} > 0)); then
+        for current in "${trimmed[@]}"; do
+          if [[ "$current" == "$entry" ]]; then
+            exists=1
+            break
+          fi
+        done
+      fi
+      if (( exists == 1 )); then
+        continue
+      fi
+      trimmed+=("$entry")
+    done
+  fi
+
+  local joined=""
+  if ((${#trimmed[@]} > 0)); then
+    for entry in "${trimmed[@]}"; do
+      if [[ -n "$joined" ]]; then
+        joined+="," 
+      fi
+      joined+="$entry"
+    done
+  fi
+  printf '%s' "$joined"
+}
+
+set_local_docker_images_value() {
+  local new_value
+  new_value=$(normalize_image_list "$1")
+  if [[ "${LOCAL_DOCKER_IMAGES:-}" == "$new_value" ]]; then
+    return
+  fi
+  set_config_value "LOCAL_DOCKER_IMAGES" "$new_value"
+  LOCAL_DOCKER_IMAGES="$new_value"
+  if [[ -n "$new_value" ]]; then
+    log "Updated LOCAL_DOCKER_IMAGES to: ${new_value}"
+  else
+    log "Cleared LOCAL_DOCKER_IMAGES"
+  fi
+}
+
+ensure_local_image_in_list() {
+  local image="$1"
+  local current
+  current=$(normalize_image_list "${LOCAL_DOCKER_IMAGES:-}")
+  if [[ -z "$current" ]]; then
+    set_local_docker_images_value "$image"
+    return
+  fi
+
+  IFS=',' read -ra entries <<< "$current"
+  local entry
+  if ((${#entries[@]} > 0)); then
+    for entry in "${entries[@]}"; do
+      if [[ "$entry" == "$image" ]]; then
+        # Already present
+        set_local_docker_images_value "$current"
+        return
+      fi
+    done
+  fi
+
+  current="${current},${image}"
+  set_local_docker_images_value "$current"
+}
+
+remove_local_image_from_list() {
+  local image="$1"
+  local current
+  current=$(normalize_image_list "${LOCAL_DOCKER_IMAGES:-}")
+  [[ -z "$current" ]] && return
+
+  IFS=',' read -ra entries <<< "$current"
+  local kept=()
+  local entry
+  if ((${#entries[@]} > 0)); then
+    for entry in "${entries[@]}"; do
+      [[ "$entry" == "$image" ]] && continue
+      kept+=("$entry")
+    done
+  fi
+
+  local joined=""
+  if ((${#kept[@]} > 0)); then
+    for entry in "${kept[@]}"; do
+      if [[ -n "$joined" ]]; then
+        joined+="," 
+      fi
+      joined+="$entry"
+    done
+  fi
+
+  set_local_docker_images_value "$joined"
+}
+
+detect_kind_architecture() {
+  local arch=""
+
+  if command -v kubectl >/dev/null 2>&1 && [[ -n "${K8S_CONTEXT:-}" ]]; then
+    arch=$(kubectl --context "$K8S_CONTEXT" get nodes -o jsonpath='{.items[0].status.nodeInfo.architecture}' 2>/dev/null || true)
+  fi
+
+  if [[ -z "$arch" ]] && command -v kind >/dev/null 2>&1 && command -v docker >/dev/null 2>&1; then
+    if [[ -n "${KIND_CLUSTER_NAME:-}" ]]; then
+      local node
+      node=$(kind get nodes --name "$KIND_CLUSTER_NAME" 2>/dev/null | head -n1 || true)
+      if [[ -n "$node" ]]; then
+        arch=$(docker inspect --format '{{.Architecture}}' "$node" 2>/dev/null || true)
+      fi
+    fi
+  fi
+
+  if [[ -z "$arch" ]]; then
+    arch=$(uname -m)
+  fi
+
+  case "$arch" in
+    arm64|aarch64)
+      printf 'arm64'
+      ;;
+    amd64|x86_64)
+      printf 'amd64'
+      ;;
+    *)
+      die "Unsupported architecture '${arch}' for determining enterprise dev image suffix"
+      ;;
+  esac
+}
+
+update_enterprise_dev_config() {
+  local values_path="$1"
+  local repository="$2"
+  local tag="$3"
+  local pull_policy="$4"
+  local license_server="${5:-https://license.dify.dev/server}"
+
+  # Step 1: Update repository
+  sed -i.bak '/^enterprise:/,/^[a-z]/ {
+    /^  image:/,/^  [a-z]/ {
+      s|^    repository:.*|    repository: '"${repository}"'|
+    }
+  }' "$values_path"
+  
+  # Step 2: Add or update tag (add after repository if not exists)
+  if grep -A 10 '^enterprise:' "$values_path" | grep -A 5 '^  image:' | grep -q '    tag:'; then
+    # Update existing tag
+    sed -i.bak '/^enterprise:/,/^[a-z]/ {
+      /^  image:/,/^  [a-z]/ {
+        s|^    tag:.*|    tag: "'"${tag}"'"|
+      }
+    }' "$values_path"
+  else
+    # Add tag after repository
+    sed -i.bak '/^enterprise:/,/^[a-z]/ {
+      /^  image:/,/^  [a-z]/ {
+        /^    repository:/ a\
+    tag: "'"${tag}"'"
+      }
+    }' "$values_path"
+  fi
+  
+  # Step 3: Add or update pullPolicy (add after tag)
+  if grep -A 10 '^enterprise:' "$values_path" | grep -A 5 '^  image:' | grep -q '    pullPolicy:'; then
+    # Update existing pullPolicy
+    sed -i.bak '/^enterprise:/,/^[a-z]/ {
+      /^  image:/,/^  [a-z]/ {
+        s|^    pullPolicy:.*|    pullPolicy: '"${pull_policy}"'|
+      }
+    }' "$values_path"
+  else
+    # Add pullPolicy after tag
+    sed -i.bak '/^enterprise:/,/^[a-z]/ {
+      /^  image:/,/^  [a-z]/ {
+        /^    tag:/ a\
+    pullPolicy: '"${pull_policy}"'
+      }
+    }' "$values_path"
+  fi
+  
+  # Step 4: Add or update licenseServer (same level as image, add after licenseMode)
+  if grep -A 20 '^enterprise:' "$values_path" | grep -q '^  licenseServer:'; then
+    # Update existing licenseServer
+    sed -i.bak '/^enterprise:/,/^[a-z]/ {
+      s|^  licenseServer:.*|  licenseServer: "'"${license_server}"'"|
+    }' "$values_path"
+  elif grep -A 20 '^enterprise:' "$values_path" | grep -q '^#  licenseServer:'; then
+    # Uncomment and update
+    sed -i.bak '/^enterprise:/,/^[a-z]/ {
+      s|^#  licenseServer:.*|  licenseServer: "'"${license_server}"'"|
+    }' "$values_path"
+  else
+    # Add licenseServer after licenseMode
+    sed -i.bak '/^enterprise:/,/^[a-z]/ {
+      /^  licenseMode:/ a\
+  licenseServer: "'"${license_server}"'"
+    }' "$values_path"
+  fi
+  
+  # Clean up backup files
+  rm -f "${values_path}.bak"
+}
+
+restore_enterprise_default_config() {
+  local values_path="$1"
+  
+  # Step 1: Restore repository to default (langgenius/dify-enterprise)
+  sed -i.bak '/^enterprise:/,/^[a-z]/ {
+    /^  image:/,/^  [a-z]/ {
+      s|^    repository:.*|    repository: langgenius/dify-enterprise|
+    }
+  }' "$values_path"
+  
+  # Step 2: Remove tag line if exists
+  sed -i.bak '/^enterprise:/,/^[a-z]/ {
+    /^  image:/,/^  [a-z]/ {
+      /^    tag:/d
+    }
+  }' "$values_path"
+  
+  # Step 3: Remove pullPolicy line if exists
+  sed -i.bak '/^enterprise:/,/^[a-z]/ {
+    /^  image:/,/^  [a-z]/ {
+      /^    pullPolicy:/d
+    }
+  }' "$values_path"
+  
+  # Step 4: Remove licenseServer line if exists (commented or uncommented)
+  sed -i.bak '/^enterprise:/,/^[a-z]/ {
+    /^  licenseServer:/d
+    /^#  licenseServer:/d
+  }' "$values_path"
+  
+  # Clean up backup files
+  rm -f "${values_path}.bak"
+  
+  log "Restored enterprise configuration to default state"
+}
+
+handle_debed_command() {
+  local values_path
+  if ! values_path=$(resolve_values_file_for_update); then
+    die "Unable to locate Helm values file for update"
+  fi
+  
+  log "Restoring enterprise configuration to default (removing dev mode settings)..."
+  restore_enterprise_default_config "$values_path"
+  log "✓ Enterprise configuration restored to default"
+  log "  - Repository: langgenius/dify-enterprise"
+  log "  - Removed: tag, pullPolicy, licenseServer"
+  log ""
+  log "Run 'kubedify install' to apply changes"
+}
+
+sync_enterprise_dev_mode() {
+  resolve_enterprise_chart_image
+  require_cmd docker
+  local desired="${1:-${USE_ENTERPRISE_DEV:-false}}"
+  desired=$(printf '%s' "$desired" | tr '[:upper:]' '[:lower:]')
+  if [[ "$desired" != "true" ]]; then
+    desired="false"
+  fi
+
+  local values_path
+  if ! values_path=$(resolve_values_file_for_update); then
+    die "Unable to locate Helm values file for update"
+  fi
+
+  if [[ "$desired" == "true" ]]; then
+    # Enable enterprise dev mode: update config and use local image
+    local arch
+    arch=$(detect_kind_architecture)
+    local dev_repo="dify-enterprise-dev"
+    local dev_tag="${ENTERPRISE_CHART_IMAGE_TAG}-${arch}"
+    local dev_image="${dev_repo}:${dev_tag}"
+
+    if ! docker image inspect "$dev_image" >/dev/null 2>&1; then
+      die "Required local enterprise dev image '${dev_image}' not found. Build or load this image before enabling USE_ENTERPRISE_DEV."
+    fi
+
+    # Update values.yaml with dev config
+    update_enterprise_dev_config "$values_path" "$dev_repo" "$dev_tag" "Never" "https://license.dify.dev/server"
+    log "Configured enterprise service to use local image ${dev_image}"
+    ensure_local_image_in_list "$dev_image"
+  else
+    # Disable enterprise dev mode: restore original values.yaml and clean up
+    log "Enterprise dev mode disabled - keeping original values.yaml unchanged"
+    
+    # Clean up dev images from LOCAL_DOCKER_IMAGES list if present
+    if [[ -n "${LOCAL_DOCKER_IMAGES:-}" ]]; then
+      local -a __dev_entries=()
+      IFS=',' read -ra __dev_entries <<< "${LOCAL_DOCKER_IMAGES}"
+      local __entry
+      if ((${#__dev_entries[@]} > 0)); then
+        for __entry in "${__dev_entries[@]}"; do
+          __entry="${__entry#${__entry%%[![:space:]]*}}"
+          __entry="${__entry%${__entry##*[![:space:]]}}"
+          [[ -z "$__entry" ]] && continue
+          if [[ "$__entry" == dify-enterprise-dev:* ]]; then
+            remove_local_image_from_list "$__entry"
+          fi
+        done
+      fi
+    fi
+  fi
 }
 
 derive_pvc_name() {
@@ -1778,6 +2231,9 @@ case "$ACTION" in
     ;;
   profile)
     handle_profile_command
+    ;;
+  debed)
+    handle_debed_command
     ;;
   install)
     install_flow

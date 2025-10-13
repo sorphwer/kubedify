@@ -5,7 +5,7 @@ profiles/*
 !profiles/default/**
 .config-profile
 .DS_Store
-
+*.so
 # Node.js dependencies
 node_modules/
 npm-debug.log*

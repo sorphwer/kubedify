@@ -34,6 +34,8 @@ Other helpful commands:
 kubedify show #show current config
 kubedify list #show helm chart versions
 kubedify profile list #show all profiles and activated one
+kubedify bed /path/to/so/files #build custom enterprise Docker image with .so files
+kubedify set USE_ENTERPRISE_DEV true #enable enterprise dev mode manually
 ./list-chart-images.sh --max 10 #show chart versions with corresponding dify-enterprise image tags
 ```
 
@@ -131,6 +133,7 @@ After a successful (non-dry) run, the chosen chart version is recorded as `LAST_
 | `kubedify list` | Lists available chart versions from the configured Helm repo. |
 | `kubedify current` | Prints the last chart version recorded during installation. |
 | `kubedify show` | Prints the active profile name, config path, and formatted JSON contents. |
+| `kubedify bed [directory]` | Interactive Docker image builder for enterprise images with custom .so files. Prompts to enable enterprise dev mode after build completion. |
 | `kubedify profile list` | Shows all stored profiles and marks the active one. |
 | `kubedify profile create <name>` | Creates a new profile directory (copied from `profiles/default/`). |
 | `kubedify profile delete <name>` | Removes a stored profile directory, including its config, values, and secrets. |
@@ -151,9 +154,26 @@ Key settings in the active profile's config include:
 - `DOCKER_USERNAME`, `DOCKER_PAT`, `IMAGE_REGISTRY_*`, `IMAGE_REPO_SECRET_NAME` – credentials used to craft the image pull secret. `DOCKER_USERNAME`/`DOCKER_PAT` live in `secrets.env`; you can still override them per-run via environment variables.
 - `PVC_BASE_NAME`, `POSTGRES_PVC_BASE_NAME`, `PVC_SIZE`, `PVC_STORAGE_CLASS`, `PVC_VERSION_TAG` – storage configuration for both the application and postgres volumes.
 - `LOCAL_DOCKER_IMAGES` – comma-separated list of images to preload into the Kind cluster.
+- `USE_ENTERPRISE_DEV` – enables enterprise development mode (defaults to `false`). Can be set via `kubedify set USE_ENTERPRISE_DEV true` or automatically enabled when using `kubedify bed`.
 - `VALUES_LOG_DIR` – destination for the prepared Helm values snapshots (defaults to the active profile's `log/` directory; relative paths resolve against the profile directory).
 
 Values may be left empty when you want the script to fall back to sane defaults (for example, `K8S_CONTEXT` defaults to `kind-<cluster>` and `IMAGE_REPO_PREFIX` defaults to `docker.io/<DOCKER_USERNAME>`).
+
+
+
+### Managing Enterprise Dev Mode
+
+```bash
+# Enable enterprise dev mode manually
+kubedify set USE_ENTERPRISE_DEV true
+
+# Disable enterprise dev mode
+kubedify set USE_ENTERPRISE_DEV false
+
+# Check current status
+kubedify show | grep USE_ENTERPRISE_DEV
+```
+
 
 ## Typical Workflow
 

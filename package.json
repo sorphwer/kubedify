@@ -1,6 +1,6 @@
 {
     "name": "kubedify",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "description": "kubernetes dify installer for you",
     "main": "bin/cli.js",
     "bin": {

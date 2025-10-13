@@ -15,6 +15,7 @@ const pkg = require('../package.json');
 const program = new Command();
 program.showHelpAfterError();
 const deployScriptPath = path.resolve(__dirname, '..', 'deploy-kind.sh');
+const interactiveBuildScriptPath = path.resolve(__dirname, '..', 'interactive-build.sh');
 const deployScriptDir = path.dirname(deployScriptPath);
 
 const WRITE_COMMANDS = new Set(['install', 'set', 'set-docker-username', 'set-docker-pat', 'profile']);
@@ -298,6 +299,17 @@ function ensureDeployScript() {
   }
 }
 
+function ensureInteractiveBuildScript() {
+  try {
+    fs.accessSync(interactiveBuildScriptPath, fs.constants.X_OK);
+  } catch (error) {
+    const message = error.code === 'ENOENT'
+      ? `Unable to locate interactive build script at ${interactiveBuildScriptPath}`
+      : `Interactive build script at ${interactiveBuildScriptPath} is not executable. Run: chmod +x interactive-build.sh`;
+    throw new Error(message);
+  }
+}
+
 function buildInvocation(commandName, commandArgs) {
   const invocation = [];
   const globalOptions = program.opts();
@@ -446,6 +458,46 @@ async function runDeployCommand(commandName, commandArgs, spinnerText) {
   });
 }
 
+async function runInteractiveBuildCommand(workingDirectory) {
+  ensureInteractiveBuildScript();
+  
+  console.log(chalk.cyan('Starting interactive Docker image build...'));
+  console.log(chalk.gray(`Working directory: ${workingDirectory}`));
+  
+  return new Promise((resolve, reject) => {
+    let child;
+
+    try {
+      child = spawn(interactiveBuildScriptPath, [workingDirectory], { 
+        stdio: 'inherit',
+        cwd: path.dirname(interactiveBuildScriptPath)
+      });
+    } catch (error) {
+      console.error(chalk.red(`Failed to launch interactive build script: ${error.message}`));
+      return reject(error);
+    }
+
+    forwardSignals(child);
+
+    child.on('error', (error) => {
+      console.error(chalk.red(`[error] interactive-build.sh failed: ${error.message}`));
+      reject(error);
+    });
+
+    child.on('close', (code) => {
+      if (code === 0) {
+        console.log(chalk.green(`[ok] Interactive build completed successfully`));
+        resolve();
+      } else {
+        console.error(chalk.red(`[error] Interactive build failed with exit code ${code}`));
+        const error = new Error(`Interactive build failed`);
+        error.exitCode = code;
+        reject(error);
+      }
+    });
+  });
+}
+
 program
   .name('kubedify')
   .description('A friendly Node.js wrapper for deploy-kind.sh')
@@ -519,6 +571,22 @@ program
   .description('Print the active configuration JSON')
   .action(function () {
     return runDeployCommand('show', [], 'Reading active configuration...');
+  });
+
+program
+  .command('bed [directory]')
+  .description('Interactive Docker image builder - build enterprise Docker image with custom .so files')
+  .action(function (directory) {
+    const workingDir = directory ? path.resolve(directory) : process.cwd();
+    showWelcome();
+    return runInteractiveBuildCommand(workingDir);
+  });
+
+program
+  .command('debed')
+  .description('Restore enterprise configuration to default (remove dev mode settings)')
+  .action(function () {
+    return runDeployCommand('debed', [], 'Restoring enterprise configuration to default...');
   });
 
 const profile = program

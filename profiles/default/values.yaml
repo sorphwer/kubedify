@@ -119,9 +119,7 @@ sandbox:
 enterprise:
   enabled: true
   image:
-    repository: dify-enterprise-dev
-    tag: "0.11.3-arm64"
-    pullPolicy: Never
+    repository: langgenius/dify-enterprise
   replicas: 1
   resources:
     limits:
@@ -138,7 +136,6 @@ enterprise:
   corsOrigins: "http://localhost:3000,http://localhost:3001,http://localhost:3002"
   serviceAccountName: "dify-enterprise"
   licenseMode: "online"
-  licenseServer: "https://license.dify.dev/server"
 
 enterpriseAudit:
   enabled: true
