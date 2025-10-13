@@ -85,6 +85,7 @@ Commands:
   show                            Print the active configuration JSON.
   profile list                    List known profiles (the active one is marked with *).
   profile create <name>           Create a new profile configuration from the example template.
+  profile delete <name>           Delete a stored profile directory and its secrets.
   profile use <name>              Switch the default profile used by subsequent runs.
 
 Options:
@@ -897,7 +898,7 @@ profile_list() {
     if [[ -n "$active" && "$name" == "$active" ]]; then
       marker="*"
     fi
-    printf '%s %s (%s)\n' "$marker" "$name" "$(config_path_for_profile "$name")"
+    printf '%s %s (%s)\n' "$marker" "$name" "$(profile_dir_for_name "$name")"
   done
   echo "[* denotes the active profile]"
 }
@@ -917,6 +918,64 @@ profile_create() {
     die "Profile '$name' already exists at $dir"
   fi
   bootstrap_profile_dir "$name"
+}
+
+profile_delete() {
+  local name="$1"
+  if [[ -z "$name" ]]; then
+    die "Usage: deploy-kind.sh profile delete <name>"
+  fi
+  validate_profile_name "$name"
+  migrate_legacy_profile_structure "$name"
+  local dir
+  dir=$(profile_dir_for_name "$name")
+  if [[ ! -d "$dir" ]]; then
+    die "Profile '$name' does not exist."
+  fi
+  if [[ "$name" == "$ACTIVE_PROFILE" && "$PROFILE_STATE_WRITABLE" != true ]]; then
+    die "Cannot delete the active profile when --profile or --config is supplied."
+  fi
+  if ! rm -rf "$dir"; then
+    die "Failed to delete profile directory at ${dir}"
+  fi
+  log "Deleted profile '${name}' at ${dir}"
+
+  if [[ "$ACTIVE_PROFILE" == "$name" ]]; then
+    local fallback=""
+    if [[ "$name" != "$DEFAULT_PROFILE_NAME" && -d "$(profile_dir_for_name "$DEFAULT_PROFILE_NAME")" ]]; then
+      fallback="$DEFAULT_PROFILE_NAME"
+    else
+      shopt -s nullglob
+      local candidate=""
+      for candidate_dir in "$CONFIG_DIR"/*; do
+        [[ -d "$candidate_dir" ]] || continue
+        candidate=$(basename "$candidate_dir")
+        [[ "$candidate" == "$name" ]] && continue
+        fallback="$candidate"
+        break
+      done
+      shopt -u nullglob
+    fi
+
+    if [[ -n "$fallback" ]]; then
+      ACTIVE_PROFILE="$fallback"
+      PROFILE_DIR=$(profile_dir_for_name "$ACTIVE_PROFILE")
+      CONFIG_FILE=$(config_path_for_profile "$ACTIVE_PROFILE")
+      PROFILE_SECRETS_FILE=$(secrets_path_for_profile "$ACTIVE_PROFILE")
+      bootstrap_profile_dir "$ACTIVE_PROFILE"
+      write_profile_state
+      log "Set active profile to '${ACTIVE_PROFILE}'"
+    else
+      ACTIVE_PROFILE=""
+      PROFILE_DIR=""
+      CONFIG_FILE=""
+      PROFILE_SECRETS_FILE=""
+      if [[ "$PROFILE_STATE_WRITABLE" == true ]]; then
+        rm -f "$PROFILE_STATE_FILE"
+      fi
+      log "Cleared active profile state; no profiles remain."
+    fi
+  fi
 }
 
 profile_use() {
@@ -955,7 +1014,7 @@ handle_profile_command() {
     die "Profile management is unavailable when --config is supplied"
   fi
   if ((${#ACTION_ARGS[@]} == 0)); then
-    die "Usage: deploy-kind.sh profile <list|create|use> [...]"
+    die "Usage: deploy-kind.sh profile <list|create|delete|use> [...]"
   fi
   local subcommand="${ACTION_ARGS[0]}"
   case "$subcommand" in
@@ -964,6 +1023,9 @@ handle_profile_command() {
       ;;
     create)
       profile_create "${ACTION_ARGS[1]:-}"
+      ;;
+    delete)
+      profile_delete "${ACTION_ARGS[1]:-}"
       ;;
     use)
       profile_use "${ACTION_ARGS[1]:-}"
@@ -1027,6 +1089,7 @@ install_flow() {
   HELM_REPO_URL=${HELM_REPO_URL:-}
   HELM_ADDITIONAL_ARGS=${HELM_ADDITIONAL_ARGS:-}
   HELM_TIMEOUT=${HELM_TIMEOUT:-10m}
+  KIND_POSTGRES_PORT=${KIND_POSTGRES_PORT:-5432}
   DOCKER_USERNAME=${DOCKER_USERNAME:-}
   DOCKER_PAT=${DOCKER_PAT:-}
   IMAGE_REGISTRY_SERVER=${IMAGE_REGISTRY_SERVER:-https://index.docker.io/v1/}
@@ -1051,7 +1114,21 @@ install_flow() {
   IMAGE_REPO_TYPE=${IMAGE_REPO_TYPE:-docker}
   INGRESS_CONTROLLER_MANIFEST=${INGRESS_CONTROLLER_MANIFEST:-https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml}
   LOCAL_DOCKER_IMAGES=${LOCAL_DOCKER_IMAGES:-}
-  VALUES_LOG_DIR=${VALUES_LOG_DIR:-"${SCRIPT_DIR}/log"}
+  local resolved_values_log_dir=""
+  if [[ -n "${VALUES_LOG_DIR:-}" ]]; then
+    if [[ "${VALUES_LOG_DIR}" == /* ]]; then
+      resolved_values_log_dir="${VALUES_LOG_DIR}"
+    elif [[ -n "${PROFILE_DIR:-}" ]]; then
+      resolved_values_log_dir="${PROFILE_DIR}/${VALUES_LOG_DIR}"
+    else
+      resolved_values_log_dir="${SCRIPT_DIR}/${VALUES_LOG_DIR}"
+    fi
+  elif [[ -n "${PROFILE_DIR:-}" ]]; then
+    resolved_values_log_dir="${PROFILE_DIR}/log"
+  else
+    resolved_values_log_dir="${SCRIPT_DIR}/log"
+  fi
+  VALUES_LOG_DIR="$resolved_values_log_dir"
   IMAGE_REPO_SECRET_SCRIPT=${IMAGE_REPO_SECRET_SCRIPT:-"${SCRIPT_DIR}/generate-image-repo-secret.sh"}
 
   require_cmd docker
@@ -1517,6 +1594,9 @@ nodes:
     protocol: TCP
   - containerPort: 443
     hostPort: ${KIND_HTTPS_PORT:-443}
+    protocol: TCP
+  - containerPort: 5432
+    hostPort: ${KIND_POSTGRES_PORT:-5432}
     protocol: TCP
 CFG
 

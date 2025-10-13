@@ -13,6 +13,7 @@ const ora = oraModule.default || oraModule;
 const pkg = require('../package.json');
 
 const program = new Command();
+program.showHelpAfterError();
 const deployScriptPath = path.resolve(__dirname, '..', 'deploy-kind.sh');
 const deployScriptDir = path.dirname(deployScriptPath);
 
@@ -452,8 +453,13 @@ program
   .option('--config <path>', 'provide an explicit config path')
   .option('--profile <name>', 'temporarily use a given profile for this invocation');
 
+let commandExecuted = false;
+program.hook('preAction', () => {
+  commandExecuted = true;
+});
+
 program
-  .command('install [version]', { isDefault: true })
+  .command('install [version]')
   .description('Deploy the chart, optionally pinning the chart version')
   .option('--dry-run', 'show what would happen without applying changes')
   .action(function (version) {
@@ -534,17 +540,33 @@ profile
   });
 
 profile
+  .command('delete <name>')
+  .description('Delete a profile configuration directory')
+  .action(function (name) {
+    return runDeployCommand('profile', ['delete', name], `Deleting profile ${name}...`);
+  });
+
+profile
   .command('use <name>')
   .description('Switch the default profile used by subsequent runs')
   .action(function (name) {
     return runDeployCommand('profile', ['use', name], `Switching to profile ${name}...`);
   });
 
-program.parseAsync(process.argv).catch((error) => {
-  if (error.exitCode) {
-    process.exit(error.exitCode);
+async function main() {
+  try {
+    await program.parseAsync(process.argv);
+    if (!commandExecuted) {
+      showWelcome();
+      await runDeployCommand('install', [], 'Installing Dify on kind...');
+    }
+  } catch (error) {
+    if (error.exitCode !== undefined) {
+      process.exit(error.exitCode);
+    }
+    console.error(chalk.red(`[error] ${error.message}`));
+    process.exit(1);
   }
+}
 
-  console.error(chalk.red(`[error] ${error.message}`));
-  process.exit(1);
-});
+main();

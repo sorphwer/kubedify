@@ -34,6 +34,7 @@ Other helpful commands:
 kubedify show #show current config
 kubedify list #show helm chart versions
 kubedify profile list #show all profiles and activated one
+./list-chart-images.sh --max 10 #show chart versions with corresponding dify-enterprise image tags
 ```
 
 
@@ -69,9 +70,10 @@ The commands assume you can reach the internet to pull Helm charts unless you ma
 
 1. **Create a working profile (recommended)**
    ```bash
-   kubedify profile create dev   # copies profiles/default/
-   kubedify profile use dev      # set dev as the active profile
-   ```
+  kubedify profile create dev   # copies profiles/default/
+  kubedify profile use dev      # set dev as the active profile
+  # kubedify profile delete dev # remove the profile again when you no longer need it
+  ```
   Kubedify copies the built-in template into your user config directory (default `~/.config/kubedify/profiles/<name>/`). Edit `config.json` and `values.yaml` under that path to customise your environment.
   
   You can always inspect the current config with `kubedify show`.
@@ -111,7 +113,7 @@ During installation the script:
 
 - Downloads a matching Helm binary when `HELM_VERSION` is set.
 - Resolves the requested chart version, deriving PVC suffixes automatically when not supplied.
-- Substitutes placeholders like `{{DIFY_BACKEND_PVC}}` inside your Helm values file and stores a timestamped copy under `log/`.
+- Substitutes placeholders like `{{DIFY_BACKEND_PVC}}` inside your Helm values file and stores a timestamped copy under the active profile directory (for example `~/.config/kubedify/profiles/<name>/log/`).
 - Creates/updates PVCs, namespaces, and the image-pull secret using the registry credentials from the config.
 - Runs `helm upgrade --install` with any extra flags from `HELM_ADDITIONAL_ARGS`.
 
@@ -131,24 +133,25 @@ After a successful (non-dry) run, the chosen chart version is recorded as `LAST_
 | `kubedify show` | Prints the active profile name, config path, and formatted JSON contents. |
 | `kubedify profile list` | Shows all stored profiles and marks the active one. |
 | `kubedify profile create <name>` | Creates a new profile directory (copied from `profiles/default/`). |
+| `kubedify profile delete <name>` | Removes a stored profile directory, including its config, values, and secrets. |
 | `kubedify profile use <name>` | Switches the default profile used by subsequent commands. |
 
 All commands honour `--config <path>` if you need to work with an ad-hoc file, and `--profile <name>` when you want to temporarily target another stored profile without switching the default.
 
-Configurations are stored per profile under your user config directory (default `~/.config/kubedify/profiles/<name>/`, overrideable via `$XDG_CONFIG_HOME` or `$KUBEDIFY_CONFIG_HOME`). Each profile contains `config.json`, `values.yaml`, and a companion `secrets.env` that holds Docker credentials. The CLI seeds that directory from the bundled templates the first time you reference a profile. Use the `profile` subcommands to create or switch profiles; once switched, subsequent invocations reuse that profile automatically.
+Configurations are stored per profile under your user config directory (default `~/.config/kubedify/profiles/<name>/`, overrideable via `$XDG_CONFIG_HOME` or `$KUBEDIFY_CONFIG_HOME`). Each profile contains `config.json`, `values.yaml`, and a companion `secrets.env` that holds Docker credentials. The CLI seeds that directory from the bundled templates the first time you reference a profile. Use the `profile` subcommands to create, delete, or switch profiles; once switched, subsequent invocations reuse that profile automatically.
 
 ## Configuration Highlights
 
 Key settings in the active profile's config include:
 
-- `KIND_CLUSTER_NAME`, `KIND_CONFIG_FILE`, `KIND_HTTP_PORT`, `KIND_HTTPS_PORT` – control Kind cluster naming and port exposure.
+- `KIND_CLUSTER_NAME`, `KIND_CONFIG_FILE`, `KIND_HTTP_PORT`, `KIND_HTTPS_PORT`, `KIND_POSTGRES_PORT` – control Kind cluster naming and port exposure.
 - `K8S_NAMESPACE`, `HELM_NAMESPACE`, `HELM_RELEASE_NAME` – namespaces and release name for Kubernetes resources.
 - `HELM_CHART`, `HELM_CHART_VERSION`, `HELM_REPO_NAME`, `HELM_REPO_URL`, `HELM_VALUES_FILE`, `HELM_ADDITIONAL_ARGS` – Helm chart location and runtime options. Set `HELM_VERSION` to download a specific Helm binary if required.
 - `HELM_TIMEOUT` – Helm upgrade timeout (defaults to `10m` if omitted).
 - `DOCKER_USERNAME`, `DOCKER_PAT`, `IMAGE_REGISTRY_*`, `IMAGE_REPO_SECRET_NAME` – credentials used to craft the image pull secret. `DOCKER_USERNAME`/`DOCKER_PAT` live in `secrets.env`; you can still override them per-run via environment variables.
 - `PVC_BASE_NAME`, `POSTGRES_PVC_BASE_NAME`, `PVC_SIZE`, `PVC_STORAGE_CLASS`, `PVC_VERSION_TAG` – storage configuration for both the application and postgres volumes.
 - `LOCAL_DOCKER_IMAGES` – comma-separated list of images to preload into the Kind cluster.
-- `VALUES_LOG_DIR` – destination for the prepared Helm values snapshots.
+- `VALUES_LOG_DIR` – destination for the prepared Helm values snapshots (defaults to the active profile's `log/` directory; relative paths resolve against the profile directory).
 
 Values may be left empty when you want the script to fall back to sane defaults (for example, `K8S_CONTEXT` defaults to `kind-<cluster>` and `IMAGE_REPO_PREFIX` defaults to `docker.io/<DOCKER_USERNAME>`).
 
@@ -172,7 +175,7 @@ Values may be left empty when you want the script to fall back to sane defaults 
 ## Notes & Tips
 
 - Keep each profile’s `values.yaml` under source control. Kubedify only swaps placeholder tokens; all other chart configuration remains manual.
-- The prepared values snapshot stored in `log/` helps reproduce the exact settings used for a deployment.
+- The prepared values snapshot stored under each profile (for example `~/.config/kubedify/profiles/<name>/log/`; relative `VALUES_LOG_DIR` entries are resolved against that profile directory) helps reproduce the exact settings used for a deployment.
 - When experimenting with multiple environments, create dedicated profiles (for example, `kubedify profile create dev`) and switch between them with `kubedify profile use <name>`; add `--profile <name>` when you want a one-off override without changing the default.
 - If you switch Docker credentials, rerun `kubedify set-docker-username` and `kubedify set-docker-pat <token>` to refresh the stored secrets (or override them per-run with environment variables).
 - Environment variables always win over values stored in `config.json`, making them ideal for per-run overrides or secrets you do not want to commit to disk.

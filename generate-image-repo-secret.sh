@@ -37,12 +37,31 @@ KUBECTL_ARGS+=(-n "$NAMESPACE")
 TMP_YAML=$(mktemp)
 trap 'rm -f "$TMP_YAML"' EXIT
 
-kubectl "${KUBECTL_ARGS[@]}" create secret docker-registry "$SECRET_NAME" \
-  --docker-server="$REGISTRY" \
-  --docker-username="$USERNAME" \
-  --docker-password="$PASSWORD" \
-  --docker-email="$EMAIL" \
+# Create Docker config JSON content
+DOCKER_CONFIG_JSON=$(cat <<EOF
+{
+  "auths": {
+    "$REGISTRY": {
+      "username": "$USERNAME",
+      "password": "$PASSWORD",
+      "email": "$EMAIL",
+      "auth": "$(echo -n "$USERNAME:$PASSWORD" | base64 -w 0)"
+    }
+  }
+}
+EOF
+)
+
+# Create secret with both .dockerconfigjson (for standard K8s) and config.json (for Kaniko)
+kubectl "${KUBECTL_ARGS[@]}" create secret generic "$SECRET_NAME" \
+  --from-literal=.dockerconfigjson="$DOCKER_CONFIG_JSON" \
+  --from-literal=config.json="$DOCKER_CONFIG_JSON" \
   --dry-run=client -o yaml >"$TMP_YAML"
+
+# Add the docker-registry type label for compatibility
+cat >>"$TMP_YAML" <<EOF
+type: kubernetes.io/dockerconfigjson
+EOF
 
 kubectl "${KUBECTL_ARGS[@]}" apply -f "$TMP_YAML"
 
