@@ -353,91 +353,178 @@ prompt_base_tag() {
   fi
 }
 
-prompt_base_repo
+# Check for existing dify-enterprise-dev images
+echo ""
+echo "Checking for existing dify-enterprise-dev images..."
+existing_images=()
+while IFS= read -r image; do
+  existing_images+=("$image")
+done < <(docker images --format '{{.Repository}}:{{.Tag}}' | grep '^dify-enterprise-dev:' | sort)
 
-prompt_base_tag
+if (( ${#existing_images[@]} > 0 )); then
+  echo "Found ${#existing_images[@]} existing dify-enterprise-dev image(s)"
+  echo ""
 
-so_search_dir="$WORK_DIR"
-so_files=()
-old_ifs=$IFS
-while IFS= read -r file; do
-  so_files+=("$file")
-done < <(find "$so_search_dir" -maxdepth 1 -type f -name '*.so' -print 2>/dev/null | sort)
-IFS=$old_ifs
+  # Display version mapping table from cache
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  Chart Version → Enterprise Tag Mapping (Latest 10)"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if [[ -f "$CACHE_FILE" ]]; then
+    if is_cache_valid "$CACHE_FILE"; then
+      # Cache is valid, display the data
+      printf "  %-16s  →  %-20s\n" "Chart Version" "Enterprise Tag"
+      echo "  ────────────────────────────────────────────────────────"
 
-if (( ${#so_files[@]} == 0 )); then
-  echo "No .so files found in $so_search_dir."
-  read -rp "Enter path to the .so file: " selected_so
-  while [[ ! -f "$selected_so" ]]; do
-    echo "File not found. Please try again."
-    read -rp "Enter path to the .so file: " selected_so
-  done
+      count=0
+      while IFS='|' read -r chart_ver ent_tag; do
+        printf "  %-16s  →  %-20s\n" "$chart_ver" "$ent_tag"
+        count=$((count + 1))
+        [[ $count -ge 10 ]] && break
+      done < <(jq -r '.versions[]' "$CACHE_FILE" 2>/dev/null)
+
+      if [[ $count -eq 0 ]]; then
+        echo ""
+        echo "  ⚠ No cached version data available"
+      else
+        echo "  ────────────────────────────────────────────────────────"
+        echo "  ℹ Cache valid for $CACHE_EXPIRY_DAYS days from last update"
+      fi
+    else
+      # Cache exists but expired
+      echo "  ⚠ Version cache expired (>$CACHE_EXPIRY_DAYS days old)"
+      echo "  ℹ Run 'kubedify list' to refresh cache"
+    fi
+  else
+    # No cache file exists
+    echo "  ℹ No cached version data found"
+    echo "  ℹ Cache will be created when you select a version during build"
+  fi
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+
+  # Present menu with existing images + build option
+  image_options=("${existing_images[@]}")
+  image_options+=("Build a new dev image")
+
+  select_menu "Select an image to use or build a new one:" "${image_options[@]}"
+
+  if [[ "${image_options[REPLY]}" == "Build a new dev image" ]]; then
+    # User chose to build, continue with build flow
+    BUILD_NEW_IMAGE=true
+  else
+    # User selected an existing image
+    selected_image="${image_options[REPLY]}"
+    echo "Using existing image: $selected_image"
+
+    # Skip build, go directly to enterprise dev mode configuration
+    echo ""
+    read -rp "Use dev mode of enterprise? This will enable USE_ENTERPRISE_DEV in your kubedify profile. (y/N): " use_dev_mode
+    case "$use_dev_mode" in
+      [yY][eE][sS]|[yY])
+        echo "Enabling enterprise dev mode with existing image..."
+        "$SCRIPT_DIR/deploy-kind.sh" set USE_ENTERPRISE_DEV true
+        echo "Enterprise dev mode enabled successfully with image: $selected_image"
+        ;;
+      *)
+        echo "Enterprise dev mode not enabled."
+        ;;
+    esac
+    exit 0
+  fi
 else
-  so_options=("${so_files[@]}")
-  so_options+=("Enter custom path")
-  select_menu "Select the .so file: " "${so_options[@]}"
-  if [[ "${so_options[REPLY]}" == "Enter custom path" ]]; then
+  echo "No existing dify-enterprise-dev images found. Will build a new image."
+  BUILD_NEW_IMAGE=true
+fi
+
+# Only proceed with build flow if user chose to build new image or no existing images
+if [[ "$BUILD_NEW_IMAGE" == true ]]; then
+  prompt_base_repo
+
+  prompt_base_tag
+
+  so_search_dir="$WORK_DIR"
+  so_files=()
+  old_ifs=$IFS
+  while IFS= read -r file; do
+    so_files+=("$file")
+  done < <(find "$so_search_dir" -maxdepth 1 -type f -name '*.so' -print 2>/dev/null | sort)
+  IFS=$old_ifs
+  
+  if (( ${#so_files[@]} == 0 )); then
+    echo "No .so files found in $so_search_dir."
     read -rp "Enter path to the .so file: " selected_so
     while [[ ! -f "$selected_so" ]]; do
       echo "File not found. Please try again."
       read -rp "Enter path to the .so file: " selected_so
     done
   else
-    selected_so="${so_options[REPLY]}"
+    so_options=("${so_files[@]}")
+    so_options+=("Enter custom path")
+    select_menu "Select the .so file: " "${so_options[@]}"
+    if [[ "${so_options[REPLY]}" == "Enter custom path" ]]; then
+      read -rp "Enter path to the .so file: " selected_so
+      while [[ ! -f "$selected_so" ]]; do
+        echo "File not found. Please try again."
+        read -rp "Enter path to the .so file: " selected_so
+      done
+    else
+      selected_so="${so_options[REPLY]}"
+    fi
   fi
+  
+  so_basename=$(basename "$selected_so")
+  
+  arch_options=("arm64" "amd64")
+  select_menu "Select target architecture: " "${arch_options[@]}"
+  selected_arch="${arch_options[REPLY]}"
+  
+  default_image_name="dify-enterprise-dev:${selected_tag}-${selected_arch}"
+  read -rp "Enter new image name (default: $default_image_name, which is required if USE_ENTERPRISE_DEV is true): " image_name
+  [[ -z "$image_name" ]] && image_name="$default_image_name"
+  
+  cat <<-EOF
+
+	Build summary:
+	  Base image: ${BASE_REPO}:${selected_tag}
+	  .so file: ${selected_so}
+	  Architecture: ${selected_arch}
+	  New image name: ${image_name}
+
+	Dockerfile preview:
+	$(printf 'FROM %s:%s\nCOPY %s /usr/lib/%s\n' "$BASE_REPO" "$selected_tag" "$so_basename" "$so_basename")
+
+	EOF
+  
+  read -rp "Proceed with build? (y/N): " confirm
+  case "$confirm" in
+    [yY][eE][sS]|[yY]) ;;
+    *) echo "Build cancelled."; exit 0 ;;
+  esac
+  
+  TMP_BUILD_DIR=$(mktemp -d)
+  cp "$selected_so" "$TMP_BUILD_DIR/"
+  cat > "$TMP_BUILD_DIR/Dockerfile" <<-EOF
+	FROM ${BASE_REPO}:${selected_tag}
+	COPY ${so_basename} /usr/lib/${so_basename}
+	EOF
+  
+  echo "Starting Docker build..."
+  docker build -t "$image_name" "$TMP_BUILD_DIR"
+  echo "Build completed: $image_name"
+
+  # Prompt for enterprise dev mode
+  echo ""
+  read -rp "Use dev mode of enterprise? This will enable USE_ENTERPRISE_DEV in your kubedify profile. (y/N): " use_dev_mode
+  case "$use_dev_mode" in
+    [yY][eE][sS]|[yY])
+      echo "Enabling enterprise dev mode..."
+      # Call deploy-kind.sh to set the configuration
+      "$SCRIPT_DIR/deploy-kind.sh" set USE_ENTERPRISE_DEV true
+      echo "Enterprise dev mode enabled successfully."
+      ;;
+    *)
+      echo "Enterprise dev mode not enabled."
+      ;;
+  esac
 fi
-
-so_basename=$(basename "$selected_so")
-
-arch_options=("arm64" "amd64")
-select_menu "Select target architecture: " "${arch_options[@]}"
-selected_arch="${arch_options[REPLY]}"
-
-default_image_name="dify-enterprise-dev:${selected_tag}-${selected_arch}"
-read -rp "Enter new image name (default: $default_image_name, which is required if USE_ENTERPRISE_DEV is true): " image_name
-[[ -z "$image_name" ]] && image_name="$default_image_name"
-
-cat <<EOF
-
-Build summary:
-  Base image: ${BASE_REPO}:${selected_tag}
-  .so file: ${selected_so}
-  Architecture: ${selected_arch}
-  New image name: ${image_name}
-
-Dockerfile preview:
-$(printf 'FROM %s:%s\nCOPY %s /usr/lib/%s\n' "$BASE_REPO" "$selected_tag" "$so_basename" "$so_basename")
-
-EOF
-
-read -rp "Proceed with build? (y/N): " confirm
-case "$confirm" in
-  [yY][eE][sS]|[yY]) ;;
-  *) echo "Build cancelled."; exit 0 ;;
-esac
-
-TMP_BUILD_DIR=$(mktemp -d)
-cp "$selected_so" "$TMP_BUILD_DIR/"
-cat > "$TMP_BUILD_DIR/Dockerfile" <<EOF
-FROM ${BASE_REPO}:${selected_tag}
-COPY ${so_basename} /usr/lib/${so_basename}
-EOF
-
-echo "Starting Docker build..."
-docker build -t "$image_name" "$TMP_BUILD_DIR"
-echo "Build completed: $image_name"
-
-# Prompt for enterprise dev mode
-echo ""
-read -rp "Use dev mode of enterprise? This will enable USE_ENTERPRISE_DEV in your kubedify profile. (y/N): " use_dev_mode
-case "$use_dev_mode" in
-  [yY][eE][sS]|[yY])
-    echo "Enabling enterprise dev mode..."
-    # Call deploy-kind.sh to set the configuration
-    "$SCRIPT_DIR/deploy-kind.sh" set USE_ENTERPRISE_DEV true
-    echo "Enterprise dev mode enabled successfully."
-    ;;
-  *)
-    echo "Enterprise dev mode not enabled."
-    ;;
-esac

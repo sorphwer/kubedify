@@ -1246,9 +1246,11 @@ install_flow() {
   fi
   log "Detected local LAN IP: ${lan_ip}"
   
-  IMAGE_REPO_PREFIX=${IMAGE_REPO_PREFIX:-"${lan_ip}:${LOCAL_REGISTRY_PORT}"}
+  # Use internal registry address for K8s pods (registry container listens on port 5000 internally)
+  IMAGE_REPO_PREFIX="${LOCAL_REGISTRY_NAME}:5000"
   IMAGE_REPO_TYPE=${IMAGE_REPO_TYPE:-docker}
   log "Using IMAGE_REPO_PREFIX: ${IMAGE_REPO_PREFIX}"
+  log "Note: External access (from host) uses ${lan_ip}:${LOCAL_REGISTRY_PORT}"
   
   INGRESS_CONTROLLER_MANIFEST=${INGRESS_CONTROLLER_MANIFEST:-https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml}
   LOCAL_DOCKER_IMAGES=${LOCAL_DOCKER_IMAGES:-}
@@ -2201,9 +2203,48 @@ render_annotations() {
   done
 }
 
+check_registry_config_in_cluster() {
+  if $DRY_RUN; then
+    return 0
+  fi
+  
+  local registry_ip="${1:-}"
+  local registry_port="${2:-17488}"
+  
+  if [[ -z "$registry_ip" ]]; then
+    return 0
+  fi
+  
+  # Get control plane node name
+  local node_name
+  node_name=$(kind get nodes --name "$KIND_CLUSTER_NAME" 2>/dev/null | head -n1)
+  
+  if [[ -z "$node_name" ]]; then
+    return 0
+  fi
+  
+  # Check if containerd config has our registry configuration
+  if ! docker exec "$node_name" cat /etc/containerd/config.toml 2>/dev/null | grep -q "${registry_ip}:${registry_port}"; then
+    log "WARNING: Existing cluster lacks proper local registry configuration."
+    log "To enable local registry support, please delete and recreate the cluster:"
+    log "  kind delete cluster --name ${KIND_CLUSTER_NAME}"
+    log "  ./deploy-kind.sh install"
+    return 1
+  fi
+  
+  return 0
+}
+
 ensure_kind_cluster() {
   if kind get clusters | grep -q "^${KIND_CLUSTER_NAME}$"; then
     log "Kind cluster '${KIND_CLUSTER_NAME}' already exists"
+    
+    # Check if existing cluster has registry configuration
+    local registry_ip
+    if registry_ip=$(get_local_lan_ip); then
+      check_registry_config_in_cluster "$registry_ip" "${LOCAL_REGISTRY_PORT:-17488}" || true
+    fi
+    
     return
   fi
 
@@ -2225,6 +2266,7 @@ ensure_kind_cluster() {
   local registry_ip
   if registry_ip=$(get_local_lan_ip); then
     local registry_port="${LOCAL_REGISTRY_PORT:-17488}"
+    local registry_name="${LOCAL_REGISTRY_NAME:-kind-registry}"
     cat >"$tmp_config" <<CFG
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
@@ -2243,8 +2285,12 @@ nodes:
 containerdConfigPatches:
 - |-
   [plugins."io.containerd.grpc.v1.cri".registry.mirrors."${registry_ip}:${registry_port}"]
-    endpoint = ["http://${LOCAL_REGISTRY_NAME:-kind-registry}:5000"]
-  [plugins."io.containerd.grpc.v1.cri".registry.configs."${LOCAL_REGISTRY_NAME:-kind-registry}:5000".tls]
+    endpoint = ["http://${registry_name}:${registry_port}"]
+  [plugins."io.containerd.grpc.v1.cri".registry.configs."${registry_ip}:${registry_port}".tls]
+    insecure_skip_verify = true
+  [plugins."io.containerd.grpc.v1.cri".registry.mirrors."${registry_name}:5000"]
+    endpoint = ["http://${registry_name}:5000"]
+  [plugins."io.containerd.grpc.v1.cri".registry.configs."${registry_name}:5000".tls]
     insecure_skip_verify = true
 CFG
   else
@@ -2344,31 +2390,27 @@ apply_pvc() {
 }
 
 create_image_secret() {
-  if [[ -z "$IMAGE_REGISTRY_SERVER" ]]; then
-    log "Skipping image pull secret because IMAGE_REGISTRY_SERVER is empty"
-    return
-  fi
-
-  if [[ -z "$IMAGE_REGISTRY_USERNAME" || -z "$IMAGE_REGISTRY_PASSWORD" ]]; then
-    die "IMAGE_REGISTRY_USERNAME and IMAGE_REGISTRY_PASSWORD must be set when IMAGE_REGISTRY_SERVER is provided"
-  fi
-
   if [[ ! -f "$IMAGE_REPO_SECRET_SCRIPT" ]]; then
     die "Secret generator script not found: $IMAGE_REPO_SECRET_SCRIPT"
   fi
 
-  log "Creating/updating image pull secret '${IMAGE_REPO_SECRET_NAME}' via ${IMAGE_REPO_SECRET_SCRIPT##*/}"
+  # For local registry, use the IMAGE_REPO_PREFIX as the registry URL
+  local registry_url="${IMAGE_REPO_PREFIX}"
+  local username="${IMAGE_REGISTRY_USERNAME:-unused}"
+  local password="${IMAGE_REGISTRY_PASSWORD:-unused}"
+
+  log "Creating/updating image pull secret '${IMAGE_REPO_SECRET_NAME}' for registry ${registry_url}"
 
   if $DRY_RUN; then
-    log "DRY-RUN: ${IMAGE_REPO_SECRET_SCRIPT##*/} ${IMAGE_REGISTRY_USERNAME} **** $K8S_NAMESPACE $IMAGE_REGISTRY_SERVER ${IMAGE_REPO_SECRET_NAME} ${K8S_CONTEXT:-}"
+    log "DRY-RUN: ${IMAGE_REPO_SECRET_SCRIPT##*/} ${username} **** $K8S_NAMESPACE ${registry_url} ${IMAGE_REPO_SECRET_NAME} ${K8S_CONTEXT:-}"
     return
   fi
 
   if ! bash "$IMAGE_REPO_SECRET_SCRIPT" \
-      "$IMAGE_REGISTRY_USERNAME" \
-      "$IMAGE_REGISTRY_PASSWORD" \
+      "$username" \
+      "$password" \
       "$K8S_NAMESPACE" \
-      "$IMAGE_REGISTRY_SERVER" \
+      "$registry_url" \
       "$IMAGE_REPO_SECRET_NAME" \
       "$K8S_CONTEXT"; then
     die "Failed to generate image pull secret using ${IMAGE_REPO_SECRET_SCRIPT}"
@@ -2411,6 +2453,38 @@ deploy_helm_chart() {
   "${helm_cmd[@]}"
 }
 
+print_access_info() {
+  if $DRY_RUN; then
+    return
+  fi
+
+  local lan_ip
+  if lan_ip=$(get_local_lan_ip); then
+    local registry_port="${LOCAL_REGISTRY_PORT:-17488}"
+    
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "✅ Deployment completed successfully!"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  🌐 Dify Application (if Ingress configured):"
+    echo "     Console: http://console.dify.local"
+
+    echo "     Enterprise:     http://enterprise.dify.local"
+    echo ""
+    echo "  💡 Tips:"
+    echo "     - Add entries to /etc/hosts for *.dify.local domains"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  else
+    echo ""
+    echo "✅ Deployment completed successfully!"
+    echo ""
+    echo "📦 PostgreSQL is accessible at: localhost:${KIND_POSTGRES_PORT:-5432}"
+    echo "🐳 Local Registry: ${LOCAL_REGISTRY_NAME:-kind-registry}:5000 (in-cluster)"
+    echo ""
+  fi
+}
+
 main() {
   ensure_kind_cluster
   connect_registry_to_kind
@@ -2423,6 +2497,7 @@ main() {
   create_image_secret
   deploy_helm_chart
   log "Deployment flow completed."
+  print_access_info
 }
 
 case "$ACTION" in

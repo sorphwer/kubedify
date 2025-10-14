@@ -45,7 +45,7 @@ DOCKER_CONFIG_JSON=$(cat <<EOF
       "username": "$USERNAME",
       "password": "$PASSWORD",
       "email": "$EMAIL",
-      "auth": "$(echo -n "$USERNAME:$PASSWORD" | base64 -w 0)"
+      "auth": "$(echo -n "$USERNAME:$PASSWORD" | base64 | tr -d '\n')"
     }
   }
 }
