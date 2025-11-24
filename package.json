@@ -4,7 +4,7 @@
   "description": "Kubernetes-based installer for Dify - Deploy into Kind clusters with one command",
   "main": "bin/cli.js",
   "bin": {
-    "kubedify": "./bin/cli.js"
+    "kubedify": "bin/cli.js"
   },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
