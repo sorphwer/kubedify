@@ -1,14 +1,40 @@
 {
-    "name": "kubedify",
-    "version": "2.0.0",
-    "description": "kubernetes dify installer for you",
-    "main": "bin/cli.js",
-    "bin": {
-      "kubedify": "./bin/cli.js" 
-    },
-    "dependencies": {
-      "chalk": "^5.3.0",  
-      "commander": "^12.0.0" ,
-      "ora": "^8.0.1"
-    }
+  "name": "kubedify",
+  "version": "3.0.0",
+  "description": "Kubernetes-based installer for Dify - Deploy into Kind clusters with one command",
+  "main": "bin/cli.js",
+  "bin": {
+    "kubedify": "./bin/cli.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sorphwer/kubedify.git"
+  },
+  "keywords": [
+    "dify",
+    "kubernetes",
+    "k8s",
+    "kind",
+    "installer",
+    "deployment",
+    "helm",
+    "cli"
+  ],
+  "author": "sorphwer",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/sorphwer/kubedify/issues"
+  },
+  "homepage": "https://github.com/sorphwer/kubedify#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "commander": "^12.0.0",
+    "ora": "^8.0.1"
   }
+}
