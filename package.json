@@ -1,6 +1,6 @@
 {
   "name": "kubedify",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "Kubernetes-based installer for Dify - Deploy into Kind clusters with one command",
   "main": "bin/cli.js",
   "bin": {
